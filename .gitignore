@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Rust build artifacts (the compiled .wasm + wasm-bindgen glue in src/wasm/
+# ARE committed — never list them here; same for dist/, which ships prebuilt
+# so consumers can install from GitHub without a Rust toolchain).
+rust/target/
+
+# Ephemera
+*.log
+.DS_Store
+.vite/

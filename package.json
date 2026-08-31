@@ -1,0 +1,54 @@
+{
+  "name": "@arcfoundry/upscaler",
+  "version": "0.1.0",
+  "description": "Headless, local-first image upscaling engine for the browser. WebGPU neural + Rust/WASM classical. Zero uploads. Zero servers.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./dist/index.js",
+    "./core": "./dist/index.js"
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "src/wasm",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "cargo build --manifest-path rust/Cargo.toml --target wasm32-unknown-unknown --release && wasm-bindgen --target web rust/target/wasm32-unknown-unknown/release/upscaler_wasm.wasm --out-dir src/wasm && node scripts/patch-wasm-glue.mjs && tsup && node scripts/copy-wasm.mjs",
+    "prepare": "node scripts/prepare.mjs",
+    "dev:examples": "vite examples/",
+    "typecheck": "tsc --noEmit",
+    "test:rust": "cargo test --manifest-path rust/Cargo.toml"
+  },
+  "engines": {
+    "node": ">=20.19"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arcfoundry/upscaler.git"
+  },
+  "bugs": {
+    "url": "https://github.com/arcfoundry/upscaler/issues"
+  },
+  "keywords": [
+    "upscaler",
+    "super-resolution",
+    "real-esrgan",
+    "webgpu",
+    "wasm",
+    "lanczos",
+    "bicubic",
+    "local-first",
+    "onnxruntime"
+  ],
+  "dependencies": {
+    "onnxruntime-web": "1.29.0"
+  },
+  "devDependencies": {
+    "tsup": "8.5.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.5"
+  }
+}
