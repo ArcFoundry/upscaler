@@ -128,10 +128,12 @@
 
     <section>
       <h2>3 · Neural (Real-ESRGAN — opt-in model download, Two-Gate)</h2>
-      <label for="modelUrl">Model URL (any CORS-enabled HTTPS URL serving a Real-ESRGAN .onnx)</label>
-      <input type="text" id="modelUrl" placeholder="https://example.com/models/realesrgan-x4-fp16.onnx" />
+      <p class="out-meta">
+        The harness ships a catalog of third-party public test models (pinned by commit SHA — see README).
+        Clicking <strong>loadModel()</strong> IS the consent: the engine fetches the precision variant
+        selected for this hardware (WebGPU → fp16, CPU → fp32), once, then serves it from the Cache API.
+      </p>
       <button id="loadModel">loadModel()</button>
-      <span class="out-meta">downloads once, then serves from the Cache API</span>
     </section>
 
     <section>

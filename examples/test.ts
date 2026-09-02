@@ -35,10 +35,16 @@ const log = (message: string, cls = ''): void => {
 };
 
 // ——— Engine instances ——————————————————————————————————————————————
-// The classical engine is download-free forever. The neural engine is only
-// constructed when the user clicks loadModel() — the Two-Gate flow.
-const classicalEngine = new UpscalerEngine();
-const neuralEngines: UpscalerEngine[] = [];
+// Third-party PUBLIC test models on Hugging Face, pinned by commit SHA
+// (see README "Model Hosting" for provenance and attribution).
+//   job (photo vs anime) and scale are YOUR choices; the engine picks the
+//   precision variant from probed hardware (fp16 for WebGPU, fp32 for CPU).
+const TEST_CATALOG = {
+  webgpu: 'https://huggingface.co/FuryTMP/RealESR_Gx4_fp16/resolve/3767133b06ab19a3636b342d44f5d2da5c3a132e/RealESR_Gx4_fp16.onnx',
+  wasm: 'https://huggingface.co/Heliosoph/realesrgan-onnx/resolve/488e5dda07333179f229a6205d92135eea4c25e9/realesr-general-x4v3.onnx',
+};
+
+const classicalEngine = new UpscalerEngine({ models: TEST_CATALOG });
 
 // ——— Event wiring (all five event types) ———————————————————————————
 const logLineForTiles = new Map<UpscalerEngine, HTMLElement>();
@@ -59,7 +65,6 @@ function wire(engine: UpscalerEngine): void {
 }
 
 wire(classicalEngine);
-
 // ——— Object-URL lifecycle contract ——————————————————————————————————
 // The ENGINE creates the URL in `complete`; the CONSUMER (this file) owns
 // revoking it. We revoke only the previous URL when a new result arrives.
@@ -113,14 +118,13 @@ runButton.addEventListener('click', () => {
       log('pick an input image first', 'error');
       return;
     }
-    const engine = neuralEngines.at(-1) ?? classicalEngine;
     runButton.disabled = true;
     tileLine = document.createElement('div');
     tileLine.textContent = 'tile_processing —';
     logEl.appendChild(tileLine);
     try {
       const buffer = await file.arrayBuffer(); // engine detaches it — do not reuse
-      const blob = await engine.process(buffer, {
+      const blob = await classicalEngine.process(buffer, {
         method: $<HTMLSelectElement>('method').value as 'lanczos' | 'bicubic' | 'neural',
         scale: Number($<HTMLSelectElement>('scale').value) as 2 | 4,
         format: $<HTMLSelectElement>('format').value as 'image/png' | 'image/webp',
@@ -137,19 +141,15 @@ runButton.addEventListener('click', () => {
 
 loadModelButton.addEventListener('click', () => {
   void (async () => {
-    const url = $<HTMLInputElement>('modelUrl').value.trim();
-    if (!url) {
-      log('enter a model URL first (this click IS the user consent — Two-Gate)', 'error');
-      return;
-    }
     loadModelButton.disabled = true;
     try {
-      const neuralEngine = new UpscalerEngine({ modelUrl: url });
-      logLineForTiles.set(neuralEngine, tileLine);
-      wire(neuralEngine);
-      await neuralEngine.loadModel();
-      neuralEngines.push(neuralEngine);
-      log('model ready (cached by the engine for next time)', 'ok');
+      // Two-Gate: this click IS the user consent to fetch the catalog
+      // variant the engine selected for this hardware.
+      const result = await classicalEngine.loadModel();
+      log(
+        `model ready — variant=${result.variant} cached=${String(result.cached)} url=${result.url.split('/').slice(3, 5).join('/')}`,
+        'ok',
+      );
     } catch (err) {
       log(`loadModel failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
     } finally {
@@ -160,9 +160,6 @@ loadModelButton.addEventListener('click', () => {
 
 window.addEventListener('pagehide', () => {
   classicalEngine.destroy();
-  for (const engine of neuralEngines) {
-    engine.destroy();
-  }
   if (lastObjectUrl) {
     URL.revokeObjectURL(lastObjectUrl);
   }
