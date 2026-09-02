@@ -166,3 +166,26 @@ PASS  (h) no console/page errors on the WASM path
 | Browser E2E classical/contract (`tests/browser-e2e.mjs`) | 9/9 |
 | Live neural gate (`tests/neural-gate.mjs`) | 19/19 |
 | Consumer smoke (fresh install from the tagged tree, zero Rust toolchain): `import { UpscalerEngine }` → `new UpscalerEngine()` → `detectDevice()` → `destroy()` | OK (`{"webgpu":false,"wasm":true,"wasmThreads":false,"lowVram":true}`) |
+
+## Publication Evidence
+
+- **Push date:** 2026-09-02. Remote: `git@github.com:ArcFoundry/upscaler.git` (SSH).
+- **`main` pushed** (`git push -u origin main`, exit 0); **tag `v0.2.0` pushed by name** (`git push origin v0.2.0`, exit 0).
+- **Remote SHA match** — `git ls-remote --heads --tags origin`:
+
+  ```
+  8684bbb40bce7d12c3d69082aaffdc50874091b7	refs/heads/main
+  7b836775dc07241cd98cfae241ad0d01c2887831	refs/tags/v0.2.0
+  8684bbb40bce7d12c3d69082aaffdc50874091b7	refs/tags/v0.2.0^{}
+  ```
+
+  Identical to local `git rev-parse main` and `git rev-parse v0.2.0^{commit}` — the remote tag pins exactly the verified engine tree.
+
+- **Real-specifier consumer test** — `npm install github:ArcFoundry/upscaler#v0.2.0` in a scratch directory outside the repo, zero Rust toolchain in PATH: install succeeded (19 packages). The lockfile resolved the specifier to `git+ssh://git@github.com/ArcFoundry/upscaler.git#8684bbb40bce7d12c3d69082aaffdc50874091b7` — the tagged commit. Import test output:
+
+  ```
+  specifier-install import+construct+detectDevice OK: {"webgpu":false,"wasm":true,"wasmThreads":false,"lowVram":true}
+  destroy OK — zero Rust toolchain used
+  ```
+
+- **⚠️ Repository visibility (action required).** At push time `ArcFoundry/upscaler` was **not publicly visible**: unauthenticated requests to `api.github.com/repos/ArcFoundry/upscaler` (repo + tags), the `codeload.github.com` tarball, `raw.githubusercontent.com`, and credential-free `git ls-remote https://github.com/ArcFoundry/upscaler.git` all returned 404 / auth-required, while the same refs were fully accessible over the authorized SSH key. The npm test above therefore resolved over the SSH transport, not the public one. To match the intended public status: repo → **Settings → General → Danger Zone → Change visibility → Public** (or `gh repo edit ArcFoundry/upscaler --visibility public --accept-visibility-change-consequences`). The one claim this cannot cover until then: the specifier install from a machine **without** org access.
