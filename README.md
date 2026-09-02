@@ -82,7 +82,8 @@ engine.destroy(); // terminates the worker, frees WASM + session memory
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `modelUrl` | `string` | — | URL of the Real-ESRGAN `.onnx` file. **Required before `loadModel()`** for neural processing. If it ends with `/`, the variant filename `realesrgan-x4-<quantization>.onnx` is appended automatically. |
+| `modelUrl` | `string` | — | URL of a single Real-ESRGAN `.onnx` file used on **every** device. Mutually exclusive with `models` (configuring both throws `INVALID_INPUT`). If it ends with `/`, the variant filename `realesrgan-x4-<quantization>.onnx` is appended automatically. |
+| `models` | `{ webgpu?: string; wasm?: string }` | — | Capability-aware model catalog. `loadModel()` probes the device and loads `models.webgpu` on WebGPU-capable hardware, otherwise `models.wasm`. A catalog missing the variant the probed device needs throws a descriptive `MODEL_VARIANT_MISSING` error. Mutually exclusive with `modelUrl`. See [Model Hosting](#model-hosting). |
 | `timeout` | `number` | `300_000` | Per-operation timeout (ms) for `loadModel()`/`process()`. On expiry the worker is terminated and a non-recoverable `TIMEOUT` error is emitted. |
 | `maxDimension` | `number` | `16384` | Maximum allowed input width/height in px. Exceeding it emits a non-recoverable `DIMENSION_LIMIT` error. Neural inference additionally refuses inputs whose 4× intermediate would exceed this limit. |
 | `ortWasmPaths` | `string` | jsDelivr CDN for the pinned ORT version | Directory for **ONNX Runtime's own** `.wasm`/`.mjs` artifacts (including the JSEP binary). Self-host by copying ORT's `dist/` files. This is unrelated to the Rust scaler binary shipped in `dist/wasm/`. |
@@ -93,7 +94,7 @@ engine.destroy(); // terminates the worker, frees WASM + session memory
 | Method | Signature | Throws / emits |
 | --- | --- | --- |
 | `detectDevice` | `(): Promise<Capabilities>` | Memoized hardware probe → `{ webgpu, wasm, wasmThreads, lowVram }`. |
-| `loadModel` | `(): Promise<void>` | Cache-first model download + ORT session creation. Throws `MODEL_URL_REQUIRED` if no `modelUrl` was configured. Emits `model_download` while streaming (nothing on cache hits). Idempotent. |
+| `loadModel` | `(): Promise<LoadModelResult>` | Cache-first model download + ORT session creation. Resolves `{ variant: 'webgpu' \| 'wasm'; url: string; cached: boolean }` — which file was actually selected and whether it came from cache. Throws `MODEL_URL_REQUIRED` if neither `modelUrl` nor `models` was configured, `MODEL_VARIANT_MISSING` if the catalog lacks the variant the probed device needs. Emits `model_download` while streaming (nothing on cache hits). Idempotent. |
 | `process` | `(buffer: ArrayBuffer, options: ProcessOptions): Promise<Blob>` | Resolves with the encoded Blob **and** emits `complete` with a blob URL (consumer revokes). Throws/see errors below. |
 | `on` | `<K>(type: K, handler): () => void` | Typed subscription; returns an unsubscribe function. |
 | `off` | `<K>(type: K, handler): void` | Removes a handler. |
@@ -114,7 +115,8 @@ All operational failures are emitted on the `error` event **and** rejected on th
 
 | Code | Meaning | Recoverable? |
 | --- | --- | --- |
-| `MODEL_URL_REQUIRED` | `loadModel()` without a configured `modelUrl`. | Yes — configure and retry |
+| `MODEL_URL_REQUIRED` | `loadModel()` without a configured `modelUrl`/`models`. | Yes — configure and retry |
+| `MODEL_VARIANT_MISSING` | The `models` catalog lacks the variant the probed device needs (e.g. no `models.wasm` on a WebGPU-less device). The error names exactly what's missing. | Yes — add the missing variant or use `modelUrl` |
 | `MODEL_NOT_LOADED` | `process({ method: 'neural' })` before `loadModel()`. | Yes — call `loadModel()` |
 | `MODEL_DOWNLOAD_FAILED` | Fetch failed (network, non-2xx, CORS). | Yes — retry |
 | `INVALID_SCALE` / `INVALID_METHOD` / `INVALID_INPUT` | Usage errors (scale ∉ {2,4}, bad format/quality, empty/detached buffer). | Yes — fix input |
@@ -141,7 +143,7 @@ engine.on(type, handler) // returns unsubscribe
 | --- | --- | --- |
 | `model_download` | `{ progress: number }` | 0..1, streamed during model fetch. **Never emitted on cache hits.** |
 | `tile_processing` | `{ tileIndex: number; totalTiles: number }` | Zero-based index of each tile as it *starts*. Classical methods are not tiled — exactly one event, `{ tileIndex: 0, totalTiles: 1 }`. |
-| `fallback` | `{ from: 'webgpu'; to: 'wasm'; reason: string }` | WebGPU failed at session creation **or** mid-inference (OOM, context/device loss): the session is disposed, recreated on WASM, and the same inference retried. Not an error. |
+| `fallback` | `{ from: 'webgpu'; to: 'wasm'; reason: string; swappedTo?: 'wasm-variant' \| 'same-file' }` | WebGPU failed at session creation **or** mid-inference (OOM, context/device loss): the session is disposed, recreated on WASM, and the same inference retried. With a `models` catalog this swaps to the `wasm` variant file (`swappedTo: 'wasm-variant'`, loaded through the same cache-first path); with a single `modelUrl` the same file is reloaded on the WASM EP (`swappedTo: 'same-file'`). Not an error. |
 | `complete` | `{ blobUrl: string }` | Object URL created by the engine for the result Blob. |
 | `error` | `{ message: string; recoverable: boolean }` | See the error table above. |
 
@@ -204,26 +206,55 @@ GitHub Pages does **not** let you set custom response headers. Deploying there m
 
 ## Model Hosting
 
-Any CORS-enabled HTTPS URL serving a Real-ESRGAN `.onnx` works: Hugging Face Hub, your own Cloudflare R2 bucket, or any static host.
+The engine is model-agnostic: it never ships weights, never hardcodes a model, and never auto-discovers one. You point it at a Real-ESRGAN `.onnx` file — any CORS-enabled HTTPS URL works: Hugging Face Hub, your own Cloudflare R2 bucket, or any static host. (File sizes vary by export and precision; the pinned test models below are ~2 MB and ~17 MB.)
 
-| Variant | Size (approx) | Precision | Recommended |
-| --- | --- | --- | --- |
-| `realesrgan-x4-fp32.onnx` | ~64 MB | fp32 | maximum fidelity |
-| `realesrgan-x4-fp16.onnx` | ~32 MB | fp16 | **default** |
-| `realesrgan-x4-int8.onnx` | ~16 MB | int8 | slowest connections |
+**Ownership of the decision:** *job* (which upscaler method) and *scale* (2×/4×) are **consumer** decisions made in `process()`. *Precision variant* (which file runs) is an **engine capability** decision made from probed hardware. The engine never selects a model by job type and never infers one from the scale — you give it URLs, it picks the file that matches the device.
 
-Self-hosting on Cloudflare R2, minimum configuration:
+Two ways to configure a model:
 
-1. Bucket → Settings → CORS policy allowing `GET` from your origin (or `*`) with headers `Content-Type`, `Content-Length`.
-2. Add the object metadata header **`Cross-Origin-Resource-Policy: cross-origin`** on the model object — pages deployed with `Cross-Origin-Embedder-Policy: require-corp` refuse to consume it otherwise.
-3. Point the engine at it:
-   ```ts
-   new UpscalerEngine({ modelUrl: 'https://models.example.com/realesrgan-x4-fp16.onnx' });
-   // or directory-style + quantization variant selection:
-   new UpscalerEngine({ modelUrl: 'https://models.example.com/', quantization: 'fp16' });
-   ```
+### 1. Single URL (`modelUrl`) — one file for every device
 
-The model is fetched once, streamed with `model_download` progress, and stored in the browser Cache API (`upscaler-models`). Subsequent runs — and any `int8`/`fp16`/`fp32` sibling — are keyed by quantization + URL and served **silently** from cache.
+```ts
+new UpscalerEngine({ modelUrl: 'https://models.example.com/realesrgan-x4-fp16.onnx' });
+// or directory-style + quantization variant selection:
+new UpscalerEngine({ modelUrl: 'https://models.example.com/', quantization: 'fp16' });
+```
+
+One download; the same file runs on the WebGPU EP and the WASM fallback EP.
+
+### 2. Capability-aware catalog (`models`) — one file per precision path
+
+```ts
+const engine = new UpscalerEngine({
+  models: {
+    // WebGPU-capable devices (Chrome/Edge with a working adapter):
+    webgpu: 'https://huggingface.co/FuryTMP/RealESR_Gx4_fp16/resolve/3767133b06ab19a3636b342d44f5d2da5c3a132e/RealESR_Gx4_fp16.onnx',
+    // Everything else (Firefox, Safari, software-GL Chrome, headless):
+    wasm: 'https://huggingface.co/Heliosoph/realesrgan-onnx/resolve/488e5dda07333179f229a6205d92135eea4c25e9/realesr-general-x4v3.onnx',
+  },
+});
+const result = await engine.loadModel();
+// → { variant: 'webgpu' | 'wasm', url: string, cached: boolean }
+```
+
+`loadModel()` probes the hardware and loads `models.webgpu` where an adapter exists, `models.wasm` otherwise — `LoadModelResult.variant` tells you which file actually ran. If a mid-flight WebGPU inference fails (OOM, device loss) and the catalog has a `wasm` entry, the session is disposed and rebuilt on the wasm variant automatically; the `fallback` event reports the swap. A catalog missing the variant a device needs throws a descriptive `MODEL_VARIANT_MISSING` error rather than guessing.
+
+The URLs above are public third-party Hugging Face uploads of Real-ESRGAN exports, **pinned by commit SHA** — they are what this repo's examples and automated browser verification use. They are convenient for testing; read the next part before shipping to production.
+
+### Pinning and production hosting
+
+- **Always pin by revision.** `https://huggingface.co/<org>/<repo>/resolve/main/<file>.onnx` is a moving target — `main` can be updated, moved, or deleted under you. Use `/resolve/<commit-sha>/<file>.onnx` (the commit SHA is on any HF file page's history). The engine's cache is keyed by the full URL, so a changed URL is simply a new cache entry.
+- **Third-party Hugging Face hosting is a valid production strategy**, not just a test convenience: the Hub is CDN-backed and CORS-enabled, and it works from cross-origin-isolated pages (verified with this repo's examples under COOP/COEP). Attribute the model authors when the export you serve requires it — see [Attribution](#attribution). If your license terms or scale demand it, mirror the pinned file to your own bucket instead.
+- **Self-hosting (Cloudflare R2 or any static host), minimum configuration:**
+  1. Bucket → Settings → CORS policy allowing `GET` from your origin (or `*`) with headers `Content-Type`, `Content-Length`.
+  2. Add the object metadata header **`Cross-Origin-Resource-Policy: cross-origin`** on the model object — pages deployed with `Cross-Origin-Embedder-Policy: require-corp` refuse to consume it otherwise.
+  3. Point the engine at the pinned URL with `modelUrl` or `models` as above.
+
+The model is fetched once, streamed with `model_download` progress, and stored in the browser Cache API (`upscaler-models`), keyed by URL. Subsequent loads — including on a fresh page — are served **silently** from cache: no progress events, zero model network requests, and `loadModel()` resolves with `cached: true`.
+
+### Attribution
+
+Real-ESRGAN — © xinntao / the XPixelGroup community ([github.com/xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)), licensed **BSD-3-Clause**. The `.onnx` files you host are exports of their trained weights; respect the code and model licenses of the export source you obtain them from.
 
 ---
 
