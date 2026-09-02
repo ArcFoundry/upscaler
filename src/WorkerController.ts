@@ -13,15 +13,16 @@
 
 import type { OutputFormat } from './Codec.js';
 import type { Capabilities } from './DeviceRouter.js';
-import type { Quantization } from './ModelManager.js';
 import { UpscalerError, upscalerErrorFromWire, type UpscalerErrorCode } from './errors.js';
 
 /** The processing methods the engine supports. */
 export type Method = 'lanczos' | 'bicubic' | 'neural';
 
 export interface LoadModelParams {
-  modelUrl: string;
-  quantization: Quantization;
+  /** Simple path (mutually exclusive with `models`). */
+  modelUrl?: string;
+  /** Catalog path: capability-aware variants; selection happens in the worker. */
+  models?: { webgpu?: string; wasm?: string };
   capabilities: Capabilities;
   ortWasmPaths?: string;
 }
@@ -44,8 +45,8 @@ export type WorkerRequest =
 export type WorkerResponse =
   | { kind: 'model_download'; id: number; progress: number }
   | { kind: 'tile_processing'; id: number; tileIndex: number; totalTiles: number }
-  | { kind: 'fallback'; id: number; reason: string }
-  | { kind: 'ready'; id: number }
+  | { kind: 'fallback'; id: number; reason: string; swappedTo?: 'wasm-variant' | 'same-file' }
+  | { kind: 'ready'; id: number; variant: 'webgpu' | 'wasm'; url: string; cached: boolean }
   | { kind: 'done'; id: number; blob: Blob }
   | { kind: 'error'; id: number; code: UpscalerErrorCode; message: string; recoverable: boolean };
 
@@ -86,8 +87,12 @@ export class WorkerController {
     return this.#pending !== null;
   }
 
-  loadModel(params: LoadModelParams): Promise<void> {
-    return this.#run((id) => [{ id, kind: 'load-model', ...params }, [] as Transferable[]]) as Promise<void>;
+  loadModel(params: LoadModelParams): Promise<{ variant: 'webgpu' | 'wasm'; url: string; cached: boolean }> {
+    return this.#run((id) => [{ id, kind: 'load-model', ...params }, [] as Transferable[]]) as Promise<{
+      variant: 'webgpu' | 'wasm';
+      url: string;
+      cached: boolean;
+    }>;
   }
 
   process(params: ProcessParams): Promise<Blob> {
@@ -194,7 +199,7 @@ export class WorkerController {
         this.#callbacks.onEvent(message);
         return;
       case 'ready':
-        this.#settle(message.id, undefined);
+        this.#settle(message.id, { variant: message.variant, url: message.url, cached: message.cached });
         return;
       case 'done':
         this.#settle(message.id, message.blob);

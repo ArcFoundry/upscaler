@@ -118,8 +118,10 @@ declare class EventEmitter {
  * `error` event carries the same `code`-derived message.
  */
 type UpscalerErrorCode = 
-/** loadModel() called without a configured modelUrl. */
+/** loadModel() called without a configured modelUrl/models catalog. */
 'MODEL_URL_REQUIRED'
+/** The models catalog lacks the variant the probed hardware requires. */
+ | 'MODEL_VARIANT_MISSING'
 /** process({ method: 'neural' }) called before loadModel(). */
  | 'MODEL_NOT_LOADED'
 /** The model file could not be fetched from the configured URL. */
@@ -169,15 +171,66 @@ declare class UpscalerError extends Error {
 }
 
 /**
- * Model lifecycle for the upscaler engine: cache-first fetching of the
- * Real-ESRGAN ONNX file, onnxruntime-web runtime configuration, session
- * creation per device capabilities, and WebGPU→WASM fallback recovery.
+ * Capability-aware model selection — the engine's half of the ownership
+ * split documented in the README:
  *
- * This module runs INSIDE the engine worker (it creates ORT sessions, which
- * must live in the same context that runs inference).
+ *   JOB (photo vs anime)  → consumer decision. Never inferred here.
+ *   SCALE (2×/4×)         → consumer option; the engine executes it.
+ *   PRECISION (fp16/fp32/int8) → ENGINE capability decision, made from the
+ *   real probed hardware via the consumer-supplied catalog.
+ *
+ * Pure and side-effect free so it can be unit-tested without a worker and
+ * reused by consumers (e.g. to show which variant a consent dialog would
+ * fetch BEFORE asking for consent).
+ */
+
+/**
+ * Consumer-supplied catalog of precision variants. URLs are used verbatim —
+ * no filename synthesis, no default hosts.
+ */
+interface ModelCatalog {
+    /** Variant for the WebGPU execution provider (typically fp16). */
+    webgpu?: string;
+    /** Variant for the CPU/WASM execution provider (typically fp32 or int8). */
+    wasm?: string;
+}
+interface ModelSelection {
+    variant: 'webgpu' | 'wasm';
+    url: string;
+    /** URL of the fallback variant for a mid-flight WebGPU→WASM swap, if any. */
+    wasmFallbackUrl?: string;
+}
+/**
+ * Selects the variant to load. `capabilities.webgpu && catalog.webgpu` →
+ * the webgpu variant; otherwise `catalog.wasm`. A missing variant throws a
+ * typed, descriptive error naming exactly what is absent.
+ */
+declare function selectModelVariant(catalog: ModelCatalog, capabilities: Pick<Capabilities, 'webgpu'>): ModelSelection;
+
+/**
+ * Model lifecycle for the upscaler engine: cache-first fetching, ORT session
+ * creation per device capabilities, WebGPU→WASM fallback (with catalog
+ * variant swap), and export-true tensor marshaling.
+ *
+ * Selection model (documented ownership split — see README):
+ *  - JOB (photo vs anime) and SCALE are CONSUMER decisions. The engine never
+ *    selects by content and never auto-discovers model URLs.
+ *  - PRECISION is an ENGINE capability decision, made from real probed
+ *    hardware via the consumer-supplied catalog (`models.webgpu` / `models.wasm`).
  */
 
 type Quantization = 'fp32' | 'fp16' | 'int8';
+/**
+ * What `loadModel()` reports. Callers that ignore it are unaffected.
+ *  - variant: which execution-provider family the loaded session targets.
+ *  - url: the exact model URL that was selected from the catalog.
+ *  - cached: true when served from the Cache API (no network was used).
+ */
+interface LoadModelResult {
+    variant: 'webgpu' | 'wasm';
+    url: string;
+    cached: boolean;
+}
 
 /**
  * Spawns and controls the engine's Web Worker. Runs on the MAIN THREAD only.
@@ -213,15 +266,28 @@ type Method = 'lanczos' | 'bicubic' | 'neural';
  */
 
 interface UpscalerEngineConfig {
-    /** Required for neural processing — see `src/index.ts` docs. */
+    /** Simple path: one model URL for every execution provider. */
     modelUrl?: string;
+    /**
+     * Catalog path (takes precedence over `modelUrl` when both are given):
+     * capability-aware model selection. PRECISION is an engine decision made
+     * from probed hardware; JOB and SCALE remain consumer decisions. At least
+     * a `wasm` variant is required for any environment without WebGPU.
+     */
+    models?: {
+        webgpu?: string;
+        wasm?: string;
+    };
     /** Per-operation timeout in ms (worker is killed on expiry). Default 300_000. */
     timeout?: number;
     /** Maximum allowed input width/height in px. Default 16384. */
     maxDimension?: number;
     /** Override ONNX Runtime's artifact directory. Default: jsDelivr CDN. */
     ortWasmPaths?: string;
-    /** Model variant selector for directory-style modelUrl. Default 'fp16'. */
+    /**
+     * Model variant selector for directory-style `modelUrl` (simple path only).
+     * Default 'fp16'.
+     */
     quantization?: Quantization;
 }
 interface ProcessOptions {
@@ -248,12 +314,22 @@ declare class UpscalerEngine {
      */
     detectDevice(): Promise<Capabilities>;
     /**
-     * Downloads (cache-first) the neural model and creates the ORT session.
+     * Downloads (cache-first) the selected model and creates the ORT session.
      * Consumer-triggered ONLY — call this after the user has consented to the
      * download (Two-Gate flow). Emits `model_download` progress while
-     * streaming; emits nothing when the model is already cached.
+     * streaming; emits nothing and reports `cached: true` on cache hits.
+     *
+     * Catalog path: selection happens HERE against freshly probed hardware —
+     * `capabilities.webgpu && models.webgpu` → the webgpu variant; else
+     * `models.wasm` (missing variant ⇒ typed `MODEL_VARIANT_MISSING` error).
+     * The returned {@link LoadModelResult}-shaped object reports which variant
+     * and URL were selected; callers that ignore it are unaffected.
      */
-    loadModel(): Promise<void>;
+    loadModel(): Promise<{
+        variant: 'webgpu' | 'wasm';
+        url: string;
+        cached: boolean;
+    }>;
     /**
      * Processes an image buffer (any format `createImageBitmap` decodes).
      *
@@ -277,4 +353,4 @@ declare class UpscalerEngine {
     destroy(): void;
 }
 
-export { type Capabilities, DeviceRouter, EventEmitter, type Method, type ProcessOptions, type Quantization, UpscalerEngine, type UpscalerEngineConfig, UpscalerError, type UpscalerErrorCode, type UpscalerEvent, type UpscalerEventListener, type UpscalerEventType };
+export { type Capabilities, DeviceRouter, EventEmitter, type LoadModelResult, type Method, type ModelCatalog, type ProcessOptions, type Quantization, UpscalerEngine, type UpscalerEngineConfig, UpscalerError, type UpscalerErrorCode, type UpscalerEvent, type UpscalerEventListener, type UpscalerEventType, selectModelVariant };

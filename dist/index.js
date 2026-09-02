@@ -225,7 +225,7 @@ var WorkerController = class {
         this.#callbacks.onEvent(message);
         return;
       case "ready":
-        this.#settle(message.id, void 0);
+        this.#settle(message.id, { variant: message.variant, url: message.url, cached: message.cached });
         return;
       case "done":
         this.#settle(message.id, message.blob);
@@ -351,19 +351,34 @@ var UpscalerEngine = class {
     return this.#capabilities;
   }
   /**
-   * Downloads (cache-first) the neural model and creates the ORT session.
+   * Downloads (cache-first) the selected model and creates the ORT session.
    * Consumer-triggered ONLY — call this after the user has consented to the
    * download (Two-Gate flow). Emits `model_download` progress while
-   * streaming; emits nothing when the model is already cached.
+   * streaming; emits nothing and reports `cached: true` on cache hits.
+   *
+   * Catalog path: selection happens HERE against freshly probed hardware —
+   * `capabilities.webgpu && models.webgpu` → the webgpu variant; else
+   * `models.wasm` (missing variant ⇒ typed `MODEL_VARIANT_MISSING` error).
+   * The returned {@link LoadModelResult}-shaped object reports which variant
+   * and URL were selected; callers that ignore it are unaffected.
    */
   async loadModel() {
     this.#assertAlive();
-    const modelUrl = this.#resolveModelUrl();
+    if (this.#config.models && this.#config.modelUrl) {
+      throw new UpscalerError(
+        "INVALID_INPUT",
+        "Pass EITHER modelUrl OR models \u2014 the models catalog takes precedence, so a simultaneously configured modelUrl is almost certainly a mistake.",
+        { recoverable: true }
+      );
+    }
     const capabilities = await this.detectDevice();
+    let result;
     try {
-      await this.#controller.loadModel({
-        modelUrl,
-        quantization: this.#config.quantization,
+      result = await this.#controller.loadModel({
+        // Simple path: expand dir-style URL here (quantization is an
+        // engine-config concern). Catalog URLs are used verbatim.
+        modelUrl: this.#config.modelUrl ? this.#resolveModelUrl() : void 0,
+        models: this.#config.models,
         capabilities,
         ortWasmPaths: this.#config.ortWasmPaths
       });
@@ -371,6 +386,7 @@ var UpscalerEngine = class {
       throw this.#asEmitted(err);
     }
     this.#modelLoaded = true;
+    return result;
   }
   /**
    * Processes an image buffer (any format `createImageBitmap` decodes).
@@ -463,16 +479,17 @@ var UpscalerEngine = class {
     }
   }
   /**
-   * Two-Gate support: if `modelUrl` is a base directory (ends with `/`),
-   * the quantization-variant filename is appended; otherwise it is used
-   * verbatim. No default remote host is invented — a missing modelUrl throws.
+   * Two-Gate support (simple path): a directory-style `modelUrl` gets the
+   * quantization-variant filename appended. The catalog path never touches
+   * this — its URLs are used verbatim. No default remote host is invented —
+   * a missing modelUrl/models throws.
    */
   #resolveModelUrl() {
     const url = this.#config.modelUrl;
     if (!url) {
       throw new UpscalerError(
         "MODEL_URL_REQUIRED",
-        "loadModel() requires a modelUrl in the engine config. The engine never downloads a model without the consumer explicitly configuring and calling loadModel() (Two-Gate flow).",
+        "loadModel() requires either a modelUrl or a models catalog ({ webgpu?, wasm? }) in the engine config. The engine never downloads a model without the consumer explicitly configuring and calling loadModel() (Two-Gate flow).",
         { recoverable: true }
       );
     }
@@ -495,7 +512,12 @@ var UpscalerEngine = class {
         this.#events.emit({ type: "tile_processing", tileIndex: event.tileIndex, totalTiles: event.totalTiles });
         return;
       case "fallback":
-        this.#events.emit({ type: "fallback", from: "webgpu", to: "wasm", reason: event.reason });
+        this.#events.emit({
+          type: "fallback",
+          from: "webgpu",
+          to: "wasm",
+          reason: event.swappedTo === "wasm-variant" ? `${event.reason} (swapped to the wasm variant)` : event.reason
+        });
         return;
       case "error":
         this.#events.emit({ type: "error", message: event.message, recoverable: event.recoverable });
@@ -518,10 +540,30 @@ var UpscalerEngine = class {
     return error;
   }
 };
+
+// src/ModelSelection.ts
+function selectModelVariant(catalog, capabilities) {
+  if (capabilities.webgpu && catalog.webgpu) {
+    return {
+      variant: "webgpu",
+      url: catalog.webgpu,
+      ...catalog.wasm && catalog.wasm !== catalog.webgpu ? { wasmFallbackUrl: catalog.wasm } : {}
+    };
+  }
+  if (catalog.wasm) {
+    return { variant: "wasm", url: catalog.wasm };
+  }
+  throw new UpscalerError(
+    "MODEL_VARIANT_MISSING",
+    capabilities.webgpu ? 'The models catalog has no "wasm" variant. The WebGPU variant only runs on the WebGPU execution provider; supply models.wasm (a fp32/int8 export) for CPU/WASM execution.' : 'No WebGPU adapter was probed and the models catalog has no "wasm" variant. Supply models.wasm (a fp32/int8 export) for CPU/WASM execution.',
+    { recoverable: true }
+  );
+}
 export {
   DeviceRouter,
   EventEmitter,
   UpscalerEngine,
-  UpscalerError
+  UpscalerError,
+  selectModelVariant
 };
 //# sourceMappingURL=index.js.map

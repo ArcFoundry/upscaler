@@ -1,25 +1,45 @@
 /**
- * Model lifecycle for the upscaler engine: cache-first fetching of the
- * Real-ESRGAN ONNX file, onnxruntime-web runtime configuration, session
- * creation per device capabilities, and WebGPU→WASM fallback recovery.
+ * Model lifecycle for the upscaler engine: cache-first fetching, ORT session
+ * creation per device capabilities, WebGPU→WASM fallback (with catalog
+ * variant swap), and export-true tensor marshaling.
  *
- * This module runs INSIDE the engine worker (it creates ORT sessions, which
- * must live in the same context that runs inference).
+ * Selection model (documented ownership split — see README):
+ *  - JOB (photo vs anime) and SCALE are CONSUMER decisions. The engine never
+ *    selects by content and never auto-discovers model URLs.
+ *  - PRECISION is an ENGINE capability decision, made from real probed
+ *    hardware via the consumer-supplied catalog (`models.webgpu` / `models.wasm`).
  */
 
 import * as ort from 'onnxruntime-web/webgpu';
 
 import type { Capabilities } from './DeviceRouter.js';
 import { UpscalerError } from './errors.js';
+import { selectModelVariant } from './ModelSelection.js';
 
+export type { ModelCatalog } from './ModelSelection.js';
 export type Quantization = 'fp32' | 'fp16' | 'int8';
+
+/**
+ * What `loadModel()` reports. Callers that ignore it are unaffected.
+ *  - variant: which execution-provider family the loaded session targets.
+ *  - url: the exact model URL that was selected from the catalog.
+ *  - cached: true when served from the Cache API (no network was used).
+ */
+export interface LoadModelResult {
+  variant: 'webgpu' | 'wasm';
+  url: string;
+  cached: boolean;
+}
 
 /** Progress/fallback notifications relayed out of the worker by `worker.ts`. */
 export interface ModelManagerNotifications {
   /** Download progress in [0, 1]. Not called on cache hits. */
   onDownloadProgress(progress: number): void;
-  /** WebGPU → WASM fallback (session creation or inference failure). */
-  onFallback(reason: string): void;
+  /**
+   * WebGPU → WASM fallback (session creation or inference failure).
+   * `swappedTo` reports which file the new session uses.
+   */
+  onFallback(reason: string, swappedTo: 'wasm-variant' | 'same-file'): void;
 }
 
 /**
@@ -33,72 +53,201 @@ const CACHE_NAME = 'upscaler-models';
 /** Upper bound for a worker thread pool inside ORT, matching the tile cap. */
 const MAX_WASM_THREADS = 8;
 
+// ——— IEEE-754 binary16 conversion (round-half-to-even) ————————————————
+// float16 exports carry Uint16Array BIT data; ORT does not convert Float32
+// feeds silently, so the engine converts both directions explicitly.
+
+function f32ToF16Bits(value: number): number {
+  const f32 = new Float32Array(1);
+  const u32 = new Uint32Array(f32.buffer);
+  f32[0] = value;
+  const x = u32[0]!;
+
+  const sign = (x >>> 16) & 0x8000;
+  const absBits = x & 0x7fff_ffff;
+
+  // NaN (canonical quiet) / Infinity.
+  if (absBits > 0x7f80_0000) return sign | 0x7e00;
+  if (absBits === 0x7f80_0000) return sign | 0x7c00;
+
+  const exp = ((x >>> 23) & 0xff) - 127 + 15;
+  const frac = x & 0x007f_ffff;
+
+  if (exp >= 0x1f) return sign | 0x7c00; // overflow → Inf
+  if (exp > 0) {
+    const roundBit = (frac >>> 12) & 1;
+    const tail = frac & 0x0fff;
+    let half = sign | (exp << 10) | (frac >>> 13);
+    if (roundBit === 1 && (tail !== 0 || (half & 1) === 1)) half += 1;
+    return half;
+  }
+  // Subnormal range (or underflow to zero): keep 10 mantissa bits.
+  const shift = 14 - exp; // in [15, 24+] for exp in [-1, -10...]
+  if (shift > 24) return sign; // rounds to zero
+  const mant = frac | 0x0080_0000; // restore implicit leading 1
+  const kept = mant >>> shift;
+  const roundBit = (mant >>> (shift - 1)) & 1;
+  const tail = mant & ((1 << (shift - 1)) - 1);
+  const half = sign | kept; // a rounding carry may flow into the exponent — correct
+  if (roundBit === 1 && (tail !== 0 || (kept & 1) === 1)) return half + 1;
+  return half;
+}
+
+function f16BitsToF32(bits: number): number {
+  const sign = (bits & 0x8000) << 16;
+  const exp = (bits >>> 10) & 0x1f;
+  const frac = bits & 0x03ff;
+
+  const u32 = new Uint32Array(1);
+  if (exp === 0) {
+    if (frac === 0) {
+      u32[0] = sign;
+    } else {
+      // Subnormal: normalize the implicit leading 1.
+      let e = 0;
+      let f = frac;
+      while ((f & 0x0400) === 0) {
+        f <<= 1;
+        e++;
+      }
+      u32[0] = sign | ((127 - 15 - e) << 23) | ((f & 0x03ff) << 13);
+    }
+  } else if (exp === 0x1f) {
+    u32[0] = sign | 0x7f80_0000 | (frac << 13);
+  } else {
+    u32[0] = sign | ((exp - 15 + 127) << 23) | (frac << 13);
+  }
+  return new Float32Array(u32.buffer)[0]!;
+}
+
+/**
+ * The tensor conversion contract for Real-ESRGAN-family exports:
+ *  - input: RGBA → RGB strip → CHW f32, normalized per the export's dtype.
+ *  - output: CHW f32 → RGB → RGBA, clamped to [0,255], original alpha restored.
+ * The conversion never fabricates color data: RGB channels ride an opaque
+ * backing through the model and alpha is re-attached verbatim afterwards.
+ */
 export class ModelManager {
   readonly #notifications: ModelManagerNotifications;
 
   #session: ort.InferenceSession | null = null;
   #activeEP: 'webgpu' | 'wasm' | null = null;
-  #modelBytes: ArrayBuffer | null = null;
+  #activeUrl: string | null = null;
+  /** WebGPU-precision file kept hot so the fallback can swap variants. */
+  #webgpuBytes: ArrayBuffer | null = null;
+  #wasmBytes: ArrayBuffer | null = null;
   #loadedKey: string | null = null;
   #envConfigured = false;
   #ortWasmPaths: string | undefined = undefined;
+  #lastCached = false;
 
   constructor(notifications: ModelManagerNotifications) {
     this.#notifications = notifications;
   }
 
-  /** Names of the session's single input/output (Real-ESRGAN: NCHW RGB). */
+  /** Input tensor name, read from the live session — never hardcoded. */
   get inputName(): string {
-    this.#assertSession();
-    return this.#session!.inputNames[0] ?? '';
+    return this.#session?.inputNames[0] ?? '';
   }
 
   get outputName(): string {
-    this.#assertSession();
-    return this.#session!.outputNames[0] ?? '';
+    return this.#session?.outputNames[0] ?? '';
   }
 
   get isLoaded(): boolean {
     return this.#session !== null;
   }
 
+  /** Which execution-provider family the current session targets. */
+  get activeVariant(): 'webgpu' | 'wasm' | null {
+    return this.#activeEP;
+  }
+
   /**
-   * Loads (cache-first) the model and creates an ORT session. Idempotent for
-   * the same URL + quantization: a second call is a no-op.
+   * Loads (cache-first) the model and creates an ORT session.
+   *
+   * Catalog path: `capabilities.webgpu && models.webgpu` selects the WebGPU
+   * variant; otherwise `models.wasm`. A missing variant throws
+   * `MODEL_VARIANT_MISSING` naming exactly what is absent.
+   * Simple path (`models` omitted): `modelUrl` for every EP — today's
+   * behavior, unchanged.
    */
-  async loadModel(
-    modelUrl: string,
-    quantization: Quantization,
-    capabilities: Capabilities,
-    ortWasmPaths?: string,
-  ): Promise<void> {
-    const key = `${quantization}:${modelUrl}`;
-    if (this.#session && this.#loadedKey === key) {
-      return;
+  async loadModel(options: {
+    modelUrl?: string;
+    models?: { webgpu?: string; wasm?: string };
+    capabilities: Capabilities;
+    ortWasmPaths?: string;
+  }): Promise<LoadModelResult> {
+    const { modelUrl, models, capabilities } = options;
+
+    // ——— Selection (capability decision from a consumer-supplied catalog) ——
+    let selectedUrl: string;
+    if (models) {
+      // Throws MODEL_VARIANT_MISSING (typed, names what's missing) when the
+      // catalog cannot serve the probed hardware.
+      const selection = selectModelVariant(models, capabilities);
+      selectedUrl = selection.url;
+      this.#wasmFallbackUrl = selection.wasmFallbackUrl;
+    } else if (modelUrl) {
+      // Simple path: one file for every EP. Fallback reuses the same file —
+      // the consumer's informed choice (may legitimately fail for fp16).
+      selectedUrl = modelUrl;
+      this.#wasmFallbackUrl = undefined;
+    } else {
+      throw new UpscalerError(
+        'MODEL_URL_REQUIRED',
+        'loadModel() requires either a modelUrl or a models catalog ({ webgpu?, wasm? }) in the engine config. The engine never downloads a model without the consumer explicitly configuring and calling loadModel() (Two-Gate flow).',
+        { recoverable: true },
+      );
     }
 
-    this.#configureOrtEnv(capabilities, ortWasmPaths);
-    const bytes = await this.#acquireModelBytes(modelUrl, quantization);
-    this.#modelBytes = bytes;
+    const key = selectedUrl;
+    if (this.#session && this.#loadedKey === key) {
+      return { variant: this.#activeEP!, url: this.#activeUrl!, cached: this.#lastCached };
+    }
+
+    this.#configureOrtEnv(capabilities, options.ortWasmPaths);
+
+    const primaryBytes = await this.#acquireModelBytes(selectedUrl);
 
     // Drop any previous session BEFORE creating the new one so the old
-    // graph's memory is released while we still hold the bytes.
+    // graph's memory is released while we still hold the new bytes.
     this.#disposeSession();
-    await this.#createSession(bytes, capabilities);
+    await this.#createSession(primaryBytes, selectedUrl, capabilities);
     this.#loadedKey = key;
+    this.#activeUrl = selectedUrl;
+
+    // Track which file a mid-flight WebGPU→WASM fallback should use.
+    if (this.#activeEP === 'webgpu') {
+      this.#webgpuBytes = primaryBytes;
+      this.#wasmBytes = null; // wasm-variant bytes are fetched lazily via the cache-first path
+    } else {
+      this.#webgpuBytes = null;
+      this.#wasmBytes = primaryBytes;
+    }
+
+    return {
+      variant: this.#activeEP!,
+      url: this.#activeUrl!,
+      cached: this.#lastCached,
+    };
   }
 
   /**
    * Runs one inference. If the WebGPU EP fails mid-run (OOM, context loss,
-   * device loss), the session is disposed, recreated on the WASM EP, and the
-   * SAME inference is retried once — the fallback is emitted as an event, not
-   * a crash. Disposes `input`; the caller disposes the returned output tensor
-   * after reading it.
+   * device loss): dispose the session, recreate it on the WASM EP — with the
+   * catalog's wasm variant when one exists (fetched through the same
+   * cache-first path) — retry once, and emit the existing `fallback` event.
+   * Only when no alternate variant exists does fallback reuse the same file,
+   * and that failure surfaces honestly.
    */
-  async run(input: ort.Tensor): Promise<ort.Tensor> {
+  async run(image: ImageData): Promise<ImageData> {
     this.#assertSession();
+
+    const inputTensor = this.#marshalInput(image);
     try {
-      return await this.#runWithSession(this.#session!, input);
+      const output = await this.#runWithSession(this.#session!, inputTensor);
+      return this.#unmarshalOutput(image, output);
     } catch (err) {
       if (this.#activeEP !== 'webgpu') {
         throw new UpscalerError(
@@ -107,12 +256,43 @@ export class ModelManager {
           { recoverable: false, cause: err },
         );
       }
+
       const reason = err instanceof Error ? err.message : String(err);
-      this.#notifications.onFallback(reason);
       this.#disposeSession();
-      await this.#createSession(this.#modelBytes!, { webgpu: false } as Capabilities, 'wasm');
+
+      // Determine the swap target FIRST, then emit the fallback event so it
+      // always reports what the retrying session actually uses.
+      let retryBytes: ArrayBuffer | null = null;
+      let swappedTo: 'wasm-variant' | 'same-file' = 'same-file';
+      if (this.#wasmFallbackUrl) {
+        if (this.#wasmBytes === null) {
+          retryBytes = await this.#acquireModelBytes(this.#wasmFallbackUrl);
+          this.#wasmBytes = retryBytes;
+        } else {
+          retryBytes = this.#wasmBytes;
+        }
+        this.#activeUrl = this.#wasmFallbackUrl;
+        swappedTo = 'wasm-variant';
+      } else if (this.#webgpuBytes !== null) {
+        retryBytes = this.#webgpuBytes;
+      } else if (this.#wasmBytes !== null) {
+        retryBytes = this.#wasmBytes;
+      }
+
+      if (retryBytes === null) {
+        throw new UpscalerError(
+          'INFERENCE_FAILED',
+          `WebGPU inference failed and no WASM fallback bytes are available (${reason}).`,
+          { recoverable: false, cause: err },
+        );
+      }
+
+      this.#notifications.onFallback(reason, swappedTo);
+
+      await this.#createSession(retryBytes, this.#activeUrl ?? '', { webgpu: false });
       try {
-        return await this.#runWithSession(this.#session!, input);
+        const output = await this.#runWithSession(this.#session!, this.#marshalInput(image));
+        return this.#unmarshalOutput(image, output);
       } catch (retryErr) {
         throw new UpscalerError(
           'INFERENCE_FAILED',
@@ -123,12 +303,19 @@ export class ModelManager {
     }
   }
 
-  /** Disposes the ORT session and releases the retained model bytes. */
+  /** Disposes the session and releases retained model bytes. */
   dispose(): void {
     this.#disposeSession();
-    this.#modelBytes = null;
+    this.#webgpuBytes = null;
+    this.#wasmBytes = null;
     this.#loadedKey = null;
+    this.#activeUrl = null;
   }
+
+  // ——— Internals ————————————————————————————————————————————————————
+
+  /** Distinct wasm-precision variant URL for a mid-flight swap, if any. */
+  #wasmFallbackUrl: string | undefined = undefined;
 
   async #runWithSession(session: ort.InferenceSession, input: ort.Tensor): Promise<ort.Tensor> {
     try {
@@ -172,21 +359,21 @@ export class ModelManager {
       return;
     }
     this.#ortWasmPaths = ortWasmPaths;
-    const hw = typeof navigator !== 'undefined' ? (navigator.hardwareConcurrency || 4) : 4;
+    ort.env.wasm.wasmPaths = this.#ortWasmPaths ?? DEFAULT_ORT_WASM_PATHS;
+    const hw = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4;
     ort.env.wasm.numThreads = capabilities.wasmThreads ? Math.min(hw, MAX_WASM_THREADS) : 1;
     ort.env.wasm.proxy = false;
     (ort.env.wasm as { jsep?: boolean }).jsep = capabilities.webgpu;
-    ort.env.wasm.wasmPaths = this.#ortWasmPaths ?? DEFAULT_ORT_WASM_PATHS;
     this.#envConfigured = true;
   }
 
   /**
    * Cache-first model acquisition: on a Cache API hit, the bytes are served
-   * locally and NO download progress is emitted. On a miss, the response is
-   * streamed with per-chunk progress, stored in the cache, and returned.
+   * locally and NO download progress is emitted (`cached: true`). On a miss,
+   * the response is streamed with per-chunk progress, stored in the cache,
+   * and returned.
    */
-  async #acquireModelBytes(modelUrl: string, quantization: Quantization): Promise<ArrayBuffer> {
-    const cacheKey = `${quantization}:${modelUrl}`;
+  async #acquireModelBytes(modelUrl: string): Promise<ArrayBuffer> {
     let cache: Cache | null = null;
     try {
       cache = await caches.open(CACHE_NAME);
@@ -196,9 +383,9 @@ export class ModelManager {
     }
 
     if (cache) {
-      const hit = await cache.match(cacheKey);
+      const hit = await cache.match(modelUrl);
       if (hit) {
-        // Cache hit: serve silently, exactly as the contract requires.
+        this.#lastCached = true;
         return hit.arrayBuffer();
       }
     }
@@ -223,7 +410,6 @@ export class ModelManager {
     }
 
     const total = Number(response.headers.get('Content-Length') ?? '0');
-
     let bytes: ArrayBuffer;
     if (!response.body) {
       bytes = await response.arrayBuffer();
@@ -251,40 +437,41 @@ export class ModelManager {
       bytes = merged.buffer;
     }
 
-    this.#notifications.onDownloadProgress(1);
-
     if (cache) {
       // Cache for next time; a quota failure must not fail the run.
       try {
-        await cache.put(cacheKey, new Response(bytes));
+        await cache.put(modelUrl, new Response(bytes));
       } catch (err) {
         console.warn('[upscaler] could not cache model bytes', err);
       }
     }
+    this.#lastCached = false;
     return bytes;
   }
 
   /**
-   * Creates the ORT session. Prefers the WebGPU EP (with WASM partition
-   * fallback inside the graph); falls back to a WASM-only session if WebGPU
-   * cannot create one, emitting the fallback event.
+   * Creates the ORT session. Prefers the WebGPU EP (WASM partition fallback
+   * inside the graph); falls back to a WASM-only session if WebGPU cannot
+   * create one, emitting the fallback event (same-file semantics — session
+   * creation never swaps variants; mid-flight inference failure does).
    */
   async #createSession(
     modelBytes: ArrayBuffer,
+    url: string,
     capabilities: Pick<Capabilities, 'webgpu'>,
-    forceEP?: 'wasm',
   ): Promise<void> {
-    if (!forceEP && capabilities.webgpu) {
+    if (capabilities.webgpu) {
       try {
         this.#session = await ort.InferenceSession.create(modelBytes.slice(0), {
           executionProviders: ['webgpu', 'wasm'],
           graphOptimizationLevel: 'all',
         });
         this.#activeEP = 'webgpu';
+        this.#activeUrl = url;
         return;
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
-        this.#notifications.onFallback(`WebGPU session creation failed: ${reason}`);
+        this.#notifications.onFallback(`WebGPU session creation failed: ${reason}`, 'same-file');
       }
     }
     this.#session = await ort.InferenceSession.create(modelBytes.slice(0), {
@@ -292,11 +479,77 @@ export class ModelManager {
       graphOptimizationLevel: 'all',
     });
     this.#activeEP = 'wasm';
+    this.#activeUrl = url;
   }
 
   #disposeSession(): void {
     this.#session?.release().catch(() => undefined);
     this.#session = null;
     this.#activeEP = null;
+  }
+
+  /**
+   * RGBA → CHW RGB tensor with [0,1] normalization, shaped [1,3,H,W].
+   * DTYPE comes from the live session's declared input metadata: float16
+   * exports receive Uint16Array BIT data (converted here, round-half-even);
+   * float32 exports receive Float32Array. The input NAME comes from the
+   * session too — never hardcoded (`input`, `lq`, … vary by export).
+   */
+  #marshalInput(image: ImageData): ort.Tensor {
+    const { width, height, data } = image;
+    const n = width * height;
+    const meta = this.#session!.inputMetadata?.[0];
+    const isF16 = meta?.isTensor === true && meta.type === 'float16';
+
+    const planar = isF16 ? new Uint16Array(3 * n) : new Float32Array(3 * n);
+    for (let px = 0; px < n; px++) {
+      const i = px * 4;
+      const r = data[i]! / 255;
+      const g = data[i + 1]! / 255;
+      const b = data[i + 2]! / 255;
+      if (isF16) {
+        planar[px] = f32ToF16Bits(r);
+        planar[px + n] = f32ToF16Bits(g);
+        planar[px + 2 * n] = f32ToF16Bits(b);
+      } else {
+        planar[px] = r;
+        planar[px + n] = g;
+        planar[px + 2 * n] = b;
+      }
+    }
+
+    const inputName = this.#session!.inputNames[0] ?? 'x';
+    void inputName; // consumed as the feeds key in #runWithSession
+    return new ort.Tensor(isF16 ? 'float16' : 'float32', planar, [1, 3, height, width]);
+  }
+
+  /**
+   * CHW model output → RGBA ImageData: clamp [0,255], restore the ORIGINAL
+   * alpha channel (the model is RGB and never sees alpha). Output dtype is
+   * read from the session metadata — float16 outputs carry bit data that is
+   * converted back to f32 before de-normalization.
+   */
+  #unmarshalOutput(original: ImageData, output: ort.Tensor): ImageData {
+    const dims = output.dims as readonly number[];
+    const outH = dims[dims.length - 2]!;
+    const outW = dims[dims.length - 1]!;
+    const n = outW * outH;
+
+    const isF16 = output.type === 'float16';
+    const raw = output.data as Float32Array | Uint16Array;
+    const sample = (i: number): number => (isF16 ? f16BitsToF32(raw[i] as number) : (raw[i] as number));
+
+    const result = new Uint8ClampedArray(n * 4);
+    for (let px = 0; px < n; px++) {
+      const o = px * 4;
+      result[o] = Math.min(Math.max(sample(px), 0), 1) * 255;
+      result[o + 1] = Math.min(Math.max(sample(px + n), 0), 1) * 255;
+      result[o + 2] = Math.min(Math.max(sample(px + 2 * n), 0), 1) * 255;
+      const sx = Math.min(px % outW, original.width - 1);
+      const sy = Math.min(Math.floor(px / outW), original.height - 1);
+      result[o + 3] = original.data[(sy * original.width + sx) * 4 + 3]!;
+    }
+    output.dispose();
+    return new ImageData(result, outW, outH);
   }
 }

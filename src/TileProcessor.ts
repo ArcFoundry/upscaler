@@ -22,8 +22,6 @@
  * O(output × float) for a sum/weight accumulator.
  */
 
-import * as ort from 'onnxruntime-web/webgpu';
-
 import type { Capabilities } from './DeviceRouter.js';
 import type { ModelManager } from './ModelManager.js';
 
@@ -130,36 +128,13 @@ export class TileProcessor {
     return tile;
   }
 
-  /** Runs one tile through ORT: RGBA → NCHW f32 RGB [0,1] → model → RGBA. */
+  /**
+   * Runs one tile through the model. Tensor marshaling lives in
+   * ModelManager (export-true dtype, alpha restored there); this method
+   * only feeds and reads tiles.
+   */
   async #inferTile(tile: ImageData, model: ModelManager): Promise<ImageData> {
-    const { width, height, data } = tile;
-    const planar = new Float32Array(3 * width * height);
-    for (let px = 0, n = width * height; px < n; px++) {
-      const i = px * 4;
-      planar[px] = data[i]! / 255;
-      planar[px + n] = data[i + 1]! / 255;
-      planar[px + 2 * n] = data[i + 2]! / 255;
-    }
-    const input = new ort.Tensor('float32', planar, [1, 3, height, width]);
-    const output = await model.run(input); // disposes `input`
-    try {
-      const dims = output.dims as readonly number[];
-      const outH = dims[2]!;
-      const outW = dims[3]!;
-      const outData = output.data as Float32Array;
-      const result = new Uint8ClampedArray(outW * outH * 4);
-      const n = outW * outH;
-      for (let px = 0; px < n; px++) {
-        const o = px * 4;
-        result[o] = Math.round(Math.min(Math.max(outData[px]!, 0), 1) * 255);
-        result[o + 1] = Math.round(Math.min(Math.max(outData[px + n]!, 0), 1) * 255);
-        result[o + 2] = Math.round(Math.min(Math.max(outData[px + 2 * n]!, 0), 1) * 255);
-        result[o + 3] = 255;
-      }
-      return new ImageData(result, outW, outH);
-    } finally {
-      output.dispose();
-    }
+    return model.run(tile); // ModelManager marshals, infers, unmarshals
   }
 
   /**

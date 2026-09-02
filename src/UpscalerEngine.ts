@@ -22,15 +22,25 @@ import type { Quantization } from './ModelManager.js';
 import { WorkerController, type ForwardableWorkerEvent, type Method, type ProcessParams } from './WorkerController.js';
 
 export interface UpscalerEngineConfig {
-  /** Required for neural processing — see `src/index.ts` docs. */
+  /** Simple path: one model URL for every execution provider. */
   modelUrl?: string;
+  /**
+   * Catalog path (takes precedence over `modelUrl` when both are given):
+   * capability-aware model selection. PRECISION is an engine decision made
+   * from probed hardware; JOB and SCALE remain consumer decisions. At least
+   * a `wasm` variant is required for any environment without WebGPU.
+   */
+  models?: { webgpu?: string; wasm?: string };
   /** Per-operation timeout in ms (worker is killed on expiry). Default 300_000. */
   timeout?: number;
   /** Maximum allowed input width/height in px. Default 16384. */
   maxDimension?: number;
   /** Override ONNX Runtime's artifact directory. Default: jsDelivr CDN. */
   ortWasmPaths?: string;
-  /** Model variant selector for directory-style modelUrl. Default 'fp16'. */
+  /**
+   * Model variant selector for directory-style `modelUrl` (simple path only).
+   * Default 'fp16'.
+   */
   quantization?: Quantization;
 }
 
@@ -113,20 +123,38 @@ export class UpscalerEngine {
   }
 
   /**
-   * Downloads (cache-first) the neural model and creates the ORT session.
+   * Downloads (cache-first) the selected model and creates the ORT session.
    * Consumer-triggered ONLY — call this after the user has consented to the
    * download (Two-Gate flow). Emits `model_download` progress while
-   * streaming; emits nothing when the model is already cached.
+   * streaming; emits nothing and reports `cached: true` on cache hits.
+   *
+   * Catalog path: selection happens HERE against freshly probed hardware —
+   * `capabilities.webgpu && models.webgpu` → the webgpu variant; else
+   * `models.wasm` (missing variant ⇒ typed `MODEL_VARIANT_MISSING` error).
+   * The returned {@link LoadModelResult}-shaped object reports which variant
+   * and URL were selected; callers that ignore it are unaffected.
    */
-  async loadModel(): Promise<void> {
+  async loadModel(): Promise<{ variant: 'webgpu' | 'wasm'; url: string; cached: boolean }> {
     this.#assertAlive();
-    const modelUrl = this.#resolveModelUrl();
+
+    // Both paths configured: the catalog wins. Validate so the consumer
+    // learns about the ignored key instead of silently using one URL.
+    if (this.#config.models && this.#config.modelUrl) {
+      throw new UpscalerError(
+        'INVALID_INPUT',
+        'Pass EITHER modelUrl OR models — the models catalog takes precedence, so a simultaneously configured modelUrl is almost certainly a mistake.',
+        { recoverable: true },
+      );
+    }
 
     const capabilities = await this.detectDevice();
+    let result: { variant: 'webgpu' | 'wasm'; url: string; cached: boolean };
     try {
-      await this.#controller.loadModel({
-        modelUrl,
-        quantization: this.#config.quantization,
+      result = await this.#controller.loadModel({
+        // Simple path: expand dir-style URL here (quantization is an
+        // engine-config concern). Catalog URLs are used verbatim.
+        modelUrl: this.#config.modelUrl ? this.#resolveModelUrl() : undefined,
+        models: this.#config.models,
         capabilities,
         ortWasmPaths: this.#config.ortWasmPaths,
       });
@@ -134,6 +162,7 @@ export class UpscalerEngine {
       throw this.#asEmitted(err);
     }
     this.#modelLoaded = true;
+    return result;
   }
 
   /**
@@ -235,16 +264,17 @@ export class UpscalerEngine {
   }
 
   /**
-   * Two-Gate support: if `modelUrl` is a base directory (ends with `/`),
-   * the quantization-variant filename is appended; otherwise it is used
-   * verbatim. No default remote host is invented — a missing modelUrl throws.
+   * Two-Gate support (simple path): a directory-style `modelUrl` gets the
+   * quantization-variant filename appended. The catalog path never touches
+   * this — its URLs are used verbatim. No default remote host is invented —
+   * a missing modelUrl/models throws.
    */
   #resolveModelUrl(): string {
     const url = this.#config.modelUrl;
     if (!url) {
       throw new UpscalerError(
         'MODEL_URL_REQUIRED',
-        'loadModel() requires a modelUrl in the engine config. The engine never downloads a model without the consumer explicitly configuring and calling loadModel() (Two-Gate flow).',
+        'loadModel() requires either a modelUrl or a models catalog ({ webgpu?, wasm? }) in the engine config. The engine never downloads a model without the consumer explicitly configuring and calling loadModel() (Two-Gate flow).',
         { recoverable: true },
       );
     }
@@ -268,7 +298,12 @@ export class UpscalerEngine {
         this.#events.emit({ type: 'tile_processing', tileIndex: event.tileIndex, totalTiles: event.totalTiles });
         return;
       case 'fallback':
-        this.#events.emit({ type: 'fallback', from: 'webgpu', to: 'wasm', reason: event.reason });
+        this.#events.emit({
+          type: 'fallback',
+          from: 'webgpu',
+          to: 'wasm',
+          reason: event.swappedTo === 'wasm-variant' ? `${event.reason} (swapped to the wasm variant)` : event.reason,
+        });
         return;
       case 'error':
         this.#events.emit({ type: 'error', message: event.message, recoverable: event.recoverable });

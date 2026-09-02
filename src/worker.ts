@@ -202,8 +202,13 @@ async function handle(message: WorkerRequest): Promise<void> {
   switch (message.kind) {
     case 'load-model': {
       const caps = await getCapabilities();
-      await getState().model.loadModel(message.modelUrl, message.quantization, caps, message.ortWasmPaths);
-      emit({ kind: 'ready', id: message.id });
+      const result = await getState().model.loadModel({
+        modelUrl: message.modelUrl,
+        models: message.models,
+        capabilities: caps,
+        ortWasmPaths: message.ortWasmPaths,
+      });
+      emit({ kind: 'ready', id: message.id, ...result });
       return;
     }
     case 'process': {

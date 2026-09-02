@@ -20,7 +20,8 @@
     "prepare": "node scripts/prepare.mjs",
     "dev:examples": "vite examples/",
     "typecheck": "tsc --noEmit",
-    "test:rust": "cargo test --manifest-path rust/Cargo.toml"
+    "test:rust": "cargo test --manifest-path rust/Cargo.toml",
+    "test:node": "node --test \"tests/*.test.mjs\""
   },
   "engines": {
     "node": ">=20.19"

@@ -13,7 +13,8 @@
 import { DeviceRouter, type Capabilities } from './DeviceRouter.js';
 import { EventEmitter, type UpscalerEvent, type UpscalerEventListener, type UpscalerEventType } from './EventEmitter.js';
 import { UpscalerError, type UpscalerErrorCode } from './errors.js';
-import type { Quantization } from './ModelManager.js';
+import type { LoadModelResult, Quantization } from './ModelManager.js';
+import type { ModelCatalog } from './ModelSelection.js';
 import { UpscalerEngine } from './UpscalerEngine.js';
 import type { Method } from './WorkerController.js';
 
@@ -30,9 +31,15 @@ export type {
   UpscalerEventListener,
   UpscalerErrorCode,
   Quantization,
+  ModelCatalog,
+  LoadModelResult,
   Method,
 };
 
 // The configuration and options interfaces are declared in UpscalerEngine.ts
 // and re-exported here under their canonical names.
 export type { UpscalerEngineConfig, ProcessOptions } from './UpscalerEngine.js';
+
+// Pure capability→variant selection (same rules loadModel() applies) — handy
+// for showing which variant a consent dialog WOULD fetch, before consent.
+export { selectModelVariant } from './ModelSelection.js';

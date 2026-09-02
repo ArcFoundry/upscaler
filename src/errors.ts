@@ -5,8 +5,10 @@
  */
 
 export type UpscalerErrorCode =
-  /** loadModel() called without a configured modelUrl. */
+  /** loadModel() called without a configured modelUrl/models catalog. */
   | 'MODEL_URL_REQUIRED'
+  /** The models catalog lacks the variant the probed hardware requires. */
+  | 'MODEL_VARIANT_MISSING'
   /** process({ method: 'neural' }) called before loadModel(). */
   | 'MODEL_NOT_LOADED'
   /** The model file could not be fetched from the configured URL. */
