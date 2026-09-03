@@ -262,6 +262,18 @@ self.onmessage = (event: MessageEvent<WorkerRequest>): void => {
   // "current request id" is safe for attributing streamed events.
   startHeartbeat();
   void handle(message)
-    .catch(() => undefined) // handle() emits `error` itself
+    .catch((err: unknown) => {
+      // Surface EVERY worker-side throw on the wire — without this the main
+      // thread would wait for a result that is never coming (the failure
+      // mode behind "stuck at Processing…" on undecodable input).
+      const upscalerError = err instanceof UpscalerError ? err : null;
+      emit({
+        kind: 'error',
+        id: currentId,
+        code: upscalerError?.code ?? 'WORKER_FAILED',
+        message: upscalerError?.message ?? (err instanceof Error ? err.message : String(err)),
+        recoverable: upscalerError?.recoverable ?? false,
+      });
+    })
     .finally(() => stopHeartbeat());
 };

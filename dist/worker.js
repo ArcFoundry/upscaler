@@ -1188,6 +1188,15 @@ self.onmessage = (event) => {
   const message = event.data;
   currentId = message.id;
   startHeartbeat();
-  void handle(message).catch(() => void 0).finally(() => stopHeartbeat());
+  void handle(message).catch((err) => {
+    const upscalerError = err instanceof UpscalerError ? err : null;
+    emit({
+      kind: "error",
+      id: currentId,
+      code: upscalerError?.code ?? "WORKER_FAILED",
+      message: upscalerError?.message ?? (err instanceof Error ? err.message : String(err)),
+      recoverable: upscalerError?.recoverable ?? false
+    });
+  }).finally(() => stopHeartbeat());
 };
 //# sourceMappingURL=worker.js.map
