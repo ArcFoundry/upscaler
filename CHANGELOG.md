@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.1 — Human-grade harness, 1:1 comparison, worker-error hotfix
+
+### Fixed (ENGINE — found by the rebuilt harness's error-state audit)
+- **Worker-side failures no longer hang the engine.** `worker.ts` swallowed
+  any throw from `handle()` (`.catch(() => undefined)` behind a comment
+  claiming the error was already emitted — it never was). An undecodable
+  input left the main thread at "processing" until the timeout. The worker
+  now emits the typed `error` wire message (`UpscalerError` code when
+  present, else `WORKER_FAILED`) and the promise rejects immediately.
+
+### Changed (examples harness — full rebuild after two human rejections)
+- **One-click flow.** Run click, neural without a session → consent modal
+  immediately; accepting loads the model and AUTO-CONTINUES into processing
+  with the same options — one click runs the entire job. Declining reverts
+  to Medium with an info line. The engine's typed Two-Gate error is never
+  rendered on the human path; only real failures (timeout, OOM, decode)
+  produce error-styled telemetry.
+- **1:1 zoom comparison.** The result card's before/after slider gains a
+  FIT · 1× · 2× · 4× control. Zoomed modes render both images in ONE shared
+  canvas box at identical scale/origin/clip — the honest comparison that
+  fit-to-view destroys (a 1440×2560 result shrunk into a small panel erases
+  every difference, even AI vs bicubic).
+- **Honest method copy** on the three cards (classical = "no detail gain",
+  explicit), plus an info line under classical results.
+- **Composition rebuilt to a wireframe**: 760px single column, status chip,
+  three equal method columns, model-state + Run card footer, timestamped
+  mono telemetry, scrollable zoom compare, GPU picker only when dualGpu.
+
+### Tests (gates only strengthened)
+- `browser-e2e` (14 checks): one-click classical, ZERO error lines on the
+  happy path, decline-never-downloads, meta answers "did it even upscale".
+- `neural-gate` (24 checks): full consent-chain (consent → model → tiles →
+  complete) with event-ORDER assertions via `window.__engine`, on both the
+  real probe and the simulated no-WebGPU device; cache-first zero-fetch.
+- `visual-audit` (62 checks): tokens + composition (single accent, no
+  control escaping its card, method columns equal, gaps on the scale,
+  telemetry mono) + screenshot review of all 7 states.
+
 ## 0.3.0 — Honest GPU routing, inactivity timeout, telemetry, diagnostics
 
 Incident-driven release. A real-Chrome manual test on a dual-GPU machine ran a

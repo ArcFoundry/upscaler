@@ -114,10 +114,10 @@ async function clickLoadModel(page) {
         }
         const obs = new MutationObserver(() => {
           const text = logEl.textContent.slice(before);
-          const m = text.match(/model ready — variant=(\w+) cached=(\w+)/);
+          const m = text.match(/model ready — variant=(\w+)/);
           if (m) {
             obs.disconnect();
-            resolve({ ok: true, variant: m[1], cached: m[2] === 'true' });
+            resolve({ ok: true, variant: m[1], cached: /· cached ·/.test(text) });
           }
           if (text.includes('loadModel failed')) {
             obs.disconnect();
@@ -206,6 +206,9 @@ async function runProcess(page, method, scale, timeoutMs = 300000) {
     c.height = img.naturalHeight;
     const ctx = c.getContext('2d');
     ctx.drawImage(img, 0, 0);
+    if (c.width === 0 || c.height === 0) {
+      throw new Error('output image not decoded yet (naturalWidth 0)');
+    }
     const d = ctx.getImageData(0, 0, c.width, c.height).data;
     let sum = 0, sum2 = 0, min = 255, max = 0;
     const chans = [[], [], []];
@@ -239,16 +242,74 @@ async function runProcess(page, method, scale, timeoutMs = 300000) {
 }
 
 /** Captures current output pixels as a plain array for later diffing. */
-async function captureOutput(page) {
-  return page.evaluate(() => {
+/** Polls the ONE-CLICK consent chain until complete (or failure/deadline). */
+async function pollConsentChain(page, marker, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    await sleep(2500);
+    const state = await page.evaluate((m) => {
+      const logEl = document.querySelector('#log');
+      const ok = [...logEl.querySelectorAll('.line--ok')].filter((el) => el.textContent.endsWith('complete')).length;
+      const failed = [...logEl.querySelectorAll('.line--err')].filter((el) => el.textContent.includes('process failed') || el.textContent.includes('error (')).length;
+      return { ok, failed: failed > 0, tail: logEl.textContent.slice(-220) };
+    }, marker);
+    if (state.failed) {
+      return { ok: false, logTail: state.tail };
+    }
+    if (state.ok >= marker) {
+      break;
+    }
+    if (Date.now() > deadline) {
+      console.log(`        [consent-chain stall dump after ${timeoutMs}ms] ${state.tail.replace(/\n/g, ' | ')}`);
+      return { ok: false, logTail: `STALL: ${state.tail}` };
+    }
+  }
+  return { ok: true };
+}
+
+async function captureOutput(page, stats = false) {
+  return page.evaluate((wantStats) => {
     const img = document.querySelector('#output');
     const c = document.createElement('canvas');
     c.width = img.naturalWidth;
     c.height = img.naturalHeight;
     const ctx = c.getContext('2d');
     ctx.drawImage(img, 0, 0);
-    return Array.from(ctx.getImageData(0, 0, c.width, c.height).data);
-  });
+    if (c.width === 0 || c.height === 0) {
+      throw new Error('output image not decoded yet (naturalWidth 0)');
+    }
+    const d = ctx.getImageData(0, 0, c.width, c.height).data;
+    if (!wantStats) {
+      return Array.from(d);
+    }
+    let sum = 0, sum2 = 0, min = 255, max = 0;
+    const chans = [[], [], []];
+    for (let i = 0; i < d.length; i += 4) {
+      const lum = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+      sum += lum;
+      sum2 += lum * lum;
+      if (lum < min) min = lum;
+      if (lum > max) max = lum;
+      chans[0].push(d[i]);
+      chans[1].push(d[i + 1]);
+      chans[2].push(d[i + 2]);
+    }
+    const n = d.length / 4;
+    const mean = sum / n;
+    const std = Math.sqrt(sum2 / n - mean * mean);
+    return {
+      w: img.naturalWidth,
+      h: img.naturalHeight,
+      mean,
+      std,
+      min,
+      max,
+      chanStd: chans.map((arr) => {
+        const m = arr.reduce((a, b) => a + b, 0) / arr.length;
+        return Math.round(Math.sqrt(arr.reduce((a, b) => a + (b - m) * (b - m), 0) / arr.length) * 10) / 10;
+      }),
+    };
+  }, stats);
 }
 
 try {
@@ -282,6 +343,18 @@ try {
 
   await injectTestImage(page);
 
+  // Event-order recorder (gate seam): every engine event with a timestamp.
+  await page.evaluate(() => {
+    const engine = window.__engine;
+    window.__events = [];
+    const push = (type, extra = '') => window.__events.push({ type, extra, t: performance.now() });
+    engine.on('model_download', (e) => push('model_download', `p=${e.progress.toFixed(2)}`));
+    engine.on('tile_processing', (e) => push('tile_processing', `${e.tileIndex + 1}/${e.totalTiles}`));
+    engine.on('fallback', () => push('fallback'));
+    engine.on('complete', () => push('complete'));
+    engine.on('error', (e) => push('error', e.message.slice(0, 60)));
+  });
+
   // (a/c) loadModel through the harness button — catalog selection.
   const load1 = await clickLoadModel(page);
   check(
@@ -290,32 +363,82 @@ try {
     `result=${JSON.stringify(load1)}`,
   );
   check('(a) model fetched from the pinned URL (network seen for variant file)', net.model >= 1 || load1.cached, `model requests=${net.model}`);
-  check('(a) first loadModel streams download progress (not a cache hit)', await page.evaluate(() => document.querySelector('#log').textContent.includes('model_download')));
+  check('(a) first loadModel streams download progress (not a cache hit)', /model download \d+%/.test(await page.evaluate(() => document.querySelector('#log').textContent)));
   check('(a) no console/page errors during session init', consoleErrors.length === 0, consoleErrors.join(' | ').slice(0, 300));
 
-  // (d) neural 4x.
-  const n4 = await runProcess(page, 'neural', 4);
+  // (d) neural 4x through the ONE-CLICK consent chain: reset to an
+  // unloaded engine state by using a FRESH page in the same context.
+  const pageConsent = await context.newPage();
+  const netConsent = { model: 0 };
+  pageConsent.on('request', (req) => {
+    if (req.url().includes('huggingface.co') && req.url().includes('/resolve/')) netConsent.model++;
+  });
+  await pageConsent.goto(BASE, { waitUntil: 'domcontentloaded' });
+  await pageConsent.evaluate(() => {
+    const engine = window.__engine;
+    window.__events = [];
+    const push = (type, extra = '') => window.__events.push({ type, extra, t: performance.now() });
+    engine.on('model_download', (e) => push('model_download', `p=${e.progress.toFixed(2)}`));
+    engine.on('tile_processing', (e) => push('tile_processing', `${e.tileIndex + 1}/${e.totalTiles}`));
+    engine.on('fallback', () => push('fallback'));
+    engine.on('complete', () => push('complete'));
+    engine.on('error', (e) => push('error', e.message.slice(0, 60)));
+  });
+  await injectTestImage(pageConsent);
+  await pageConsent.click('#method-neural');
+  await pageConsent.click('#scaleSeg button[data-scale="4"]');
+  const markerConsent = await pageConsent.evaluate(
+    () =>
+      [...document.querySelectorAll('#log .line--ok')].filter((el) => el.textContent.endsWith('complete')).length + 1,
+  );
+  await pageConsent.click('#run');
+  await pageConsent.waitForFunction(() => !document.querySelector('#consentModal').hidden, null, { timeout: 15000 });
+  await pageConsent.click('#consentAccept');
+  // ONE click must carry consent → load → process → complete.
+  const consentOk = await pollConsentChain(pageConsent, markerConsent, 300000);
+  // Full image stats come from the chain page's result img.
+  let n4;
+  if (consentOk.ok) {
+    await pageConsent.waitForFunction(() => document.querySelector('#output') && document.querySelector('#output').naturalWidth > 0, null, { timeout: 15000 });
+    n4 = { ...(await captureOutput(pageConsent, true)), ok: true };
+  } else {
+    n4 = { ok: false, logTail: consentOk.logTail };
+  }
+
+  // (i-adjacent, mechanical) event ORDER: load happens before tiles; no
+  // error line anywhere on this happy chain.
+  const chain = await pageConsent.evaluate(() => window.__events.map((e) => e.type));
+  const loadIdx = chain.indexOf('model_download') >= 0 ? chain.indexOf('model_download') : -1;
+  check('(h1) one-click chain: consent → model_download → tile_processing → complete', consentOk.ok && chain.includes('tile_processing') && chain[chain.length - 1] === 'complete', JSON.stringify(chain.slice(0, 6)));
+  check('(h1) no error events in the consent chain', !chain.includes('error'), JSON.stringify(chain.filter((t) => t === 'error')));
+  // Cache-first contract: page1 already pulled the variant into this
+  // context's Cache Storage, so the chain page must reuse it (0 fetches).
+  // If the cache was cold at chain time, exactly 1 fetch is honest.
+  const chainCachedLine = await pageConsent.evaluate(() => document.querySelector('#log').textContent.includes('0 MB downloaded'));
+  check('(h1) chain model load served from cache (cache-first) or single fetch', netConsent.model === 0 ? chainCachedLine : netConsent.model === 1, `requests=${netConsent.model} cachedLine=${chainCachedLine}`);
+  void loadIdx;
   check('(d) neural 4x completes with exactly 384x384 output', n4.ok === true && n4.w === 384 && n4.h === 384, n4.ok ? `${n4.w}x${n4.h}` : n4.logTail);
   if (n4.ok) {
     const sane = n4.mean > 20 && n4.mean < 235 && n4.std > 15 && n4.std < 110 && n4.chanStd.every((v) => v > 8) && n4.max - n4.min > 60;
     check('(d) pixel stats non-degenerate', sane, `mean=${n4.mean.toFixed(1)} std=${n4.std.toFixed(1)} chanStd=${n4.chanStd} range=${n4.min.toFixed(0)}..${n4.max.toFixed(0)}`);
-    const neuralPixels = await captureOutput(page);
+    const neuralPixels = await captureOutput(pageConsent);
 
-    // (d) differs from bicubic 4x of the same input.
-    const b4 = await runProcess(page, 'bicubic', 4);
+    // (d) differs from bicubic 4x of the same input — same page (its engine
+    // already has the image; bicubic needs no model).
+    const b4 = await runProcess(pageConsent, 'bicubic', 4);
     check('(d) bicubic 4x regression after neural', b4.ok === true && b4.w === 384 && b4.h === 384, b4.ok ? `${b4.w}x${b4.h}` : b4.logTail);
-    const diff = await page.evaluate(({ a, b }) => {
+    const diff = await pageConsent.evaluate(({ a, b }) => {
       let sad = 0;
       for (let i = 0; i < a.length; i += 4) {
         sad += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
       }
       return sad / (a.length / 4) / 3;
-    }, { a: neuralPixels, b: await captureOutput(page) });
+    }, { a: neuralPixels, b: await captureOutput(pageConsent) });
     check('(d) neural differs meaningfully from bicubic 4x', diff > 1.0, `meanAbsDiff=${diff.toFixed(2)} per channel`);
   }
 
-  // (e) neural 2x = 4x model → Lanczos downscale.
-  const n2 = await runProcess(page, 'neural', 2);
+  // (e) neural 2x = 4x model → Lanczos downscale (pageConsent's session is hot).
+  const n2 = await runProcess(pageConsent, 'neural', 2);
   check('(e) neural 2x completes with exactly 192x192 output', n2.ok === true && n2.w === 192 && n2.h === 192, n2.ok ? `${n2.w}x${n2.h}` : n2.logTail);
 
   // (g) cache-first: FRESH page in the same context (same Cache Storage).
@@ -329,7 +452,7 @@ try {
   const load2 = await clickLoadModel(page2);
   check('(g) fresh page: loadModel reports cached=true', load2.ok === true && load2.cached === true, JSON.stringify(load2));
   check('(g) fresh page: ZERO network requests for the model file', page2Net.model === 0, `model requests=${page2Net.model}`);
-  check('(g) fresh page: no model_download progress events', !(await page2.evaluate(() => document.querySelector('#log').textContent.includes('model_download'))));
+  check('(g) fresh page: no model download progress events', !/model download \d+%/.test(await page2.evaluate(() => document.querySelector('#log').textContent)));
 
   await browser.close();
 
@@ -346,24 +469,42 @@ try {
   const capsShown = await page3.evaluate(() => document.querySelector('#caps').textContent);
   check('(c) no-WebGPU env shows honest webgpu=false badge', /webgpu:\s*false/.test(capsShown), capsShown);
 
-  // (j) Two-Gate regression first: neural before loadModel must throw.
+  // (j)+(h) Two-Gate via consent, then the FULL one-click chain on the
+  // simulated no-WebGPU device (WASM EP): Run → modal → Use AI → model →
+  // tiles → complete. The typed Two-Gate error must NEVER appear.
   await injectTestImage(page3);
   await page3.click('#method-neural');
   await page3.click('#scaleSeg button[data-scale="4"]');
   await page3.click('#run');
-  await page3.waitForFunction(() => document.querySelector('#log').textContent.includes('process failed'), null, { timeout: 15000 });
-  check('(j) Two-Gate: neural before loadModel() throws typed error', await page3.evaluate(() => document.querySelector('#log').textContent.includes('requires a prior loadModel')));
+  await page3.waitForFunction(() => !document.querySelector('#consentModal').hidden, null, { timeout: 15000 });
+  check(
+    '(j) Two-Gate: neural Run opens consent; typed error never rendered',
+    (await page3.evaluate(() => document.querySelector('#log').textContent.includes('requires a prior loadModel'))) === false,
+  );
+  await page3.click('#consentAccept');
+  const chainOk = await pollConsentChain(page3, 1, 300000);
+  check('(h) WASM-EP one-click chain completes (consent → load → tiles → complete)', chainOk.ok === true, chainOk.ok ? 'complete' : chainOk.logTail);
 
-  const load3 = await clickLoadModel(page3);
-  check('(c/h) no-WebGPU env: catalog selects wasm variant', load3.ok === true && load3.variant === 'wasm', JSON.stringify(load3));
-  check('(c/h) wasm variant fetched from its pinned URL', net3.model >= 1 || load3.cached, `model requests=${net3.model}`);
+  const ready3 = await page3.evaluate(() => {
+    const m = document.querySelector('#log').textContent.match(/model ready — variant=(\w+)/);
+    return m ? m[1] : '';
+  });
+  check('(c/h) no-WebGPU env: catalog selects wasm variant', ready3 === 'wasm', `variant=${ready3}`);
+  check('(c/h) wasm variant fetched from its pinned URL', net3.model >= 1, `model requests=${net3.model}`);
 
-  const w4 = await runProcess(page3, 'neural', 4);
+  let w4;
+  if (chainOk.ok) {
+    await page3.waitForFunction(() => document.querySelector('#output') && document.querySelector('#output').naturalWidth > 0, null, { timeout: 15000 });
+    w4 = { ...(await captureOutput(page3, true)), ok: true };
+  } else {
+    w4 = { ok: false, logTail: chainOk.logTail };
+  }
   check('(h) WASM-EP neural run completes with exactly 384x384 output', w4.ok === true && w4.w === 384 && w4.h === 384, w4.ok ? `${w4.w}x${w4.h}` : w4.logTail);
   if (w4.ok) {
     const sane = w4.mean > 20 && w4.mean < 235 && w4.std > 15 && w4.std < 110 && w4.chanStd.every((v) => v > 8);
     check('(h) WASM-EP output non-degenerate', sane, `mean=${w4.mean.toFixed(1)} std=${w4.std.toFixed(1)} chanStd=${w4.chanStd}`);
   }
+  check('(h) no error-styled telemetry lines on the chain', (await page3.evaluate(() => document.querySelectorAll('#log .line--err').length)) === 0);
   check('(h) no console/page errors on the WASM path', consoleErrors3.length === 0, consoleErrors3.join(' | ').slice(0, 300));
 
   await browser2.close();

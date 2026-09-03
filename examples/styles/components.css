@@ -1,0 +1,601 @@
+/**
+ * COMPONENTS — built exclusively on tokens.css. Exactly ONE implementation
+ * per component lives here: .btn (all buttons), .card (all sections),
+ * .seg (segmented controls), .field (drop area), .mono-panel (telemetry),
+ * .modal (consent dialog). If any two buttons differ in height, padding, or
+ * radius, this file is wrong — fix it here, never style around it.
+ */
+
+/* ——— Global ground ————————————————————————————————————————————— */
+* {
+  box-sizing: border-box;
+}
+
+/* The hidden attribute always wins — component display values must not
+   resurrect elements the JS deliberately hid (e.g. the GPU picker). */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  padding: var(--s6) var(--s4) var(--s8);
+  background: var(--bg);
+  color: var(--text);
+  font: var(--t-body);
+  max-width: 760px;
+  margin-inline: auto;
+}
+
+h1 {
+  font: var(--t-title);
+  margin: 0 0 var(--s1);
+}
+
+p.sub {
+  font: var(--t-small);
+  color: var(--muted);
+  margin: 0 0 var(--s6);
+}
+
+/* ——— .card — the ONE section container ———————————————————————— */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r2);
+  padding: var(--s4);
+  margin-bottom: var(--s4);
+}
+
+.card > h2 {
+  font: var(--t-label);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 0 0 var(--s3);
+}
+
+/* ——— .btn — THE button (exactly one implementation) ————————————— */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s2);
+  height: var(--ctl-h);
+  padding: 0 var(--s3);
+  border: 1px solid transparent;
+  border-radius: var(--r1);
+  font: var(--t-label);
+  color: var(--text);
+  background: var(--surface);
+  border-color: var(--line);
+  cursor: pointer;
+  transition: background-color var(--transition), color var(--transition), border-color var(--transition),
+    opacity var(--transition);
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Variants — modifier classes only, same metrics. */
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #151004;
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: #151004;
+}
+
+.btn--primary:active:not(:disabled) {
+  background: var(--accent-press);
+  border-color: var(--accent-press);
+}
+
+.btn--ghost {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--text);
+}
+
+/* ——— .seg — segmented control (same --ctl-h as .btn) ———————————— */
+.seg {
+  display: inline-flex;
+  height: var(--ctl-h);
+  border: 1px solid var(--line);
+  border-radius: var(--r1);
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.seg button {
+  height: 100%;
+  padding: 0 var(--s3);
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: var(--t-label);
+  cursor: pointer;
+  transition: background-color var(--transition), color var(--transition);
+}
+
+.seg button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.seg button[aria-pressed='true'] {
+  background: var(--accent);
+  color: #151004;
+}
+
+.seg button:not([aria-pressed='true']):hover {
+  color: var(--text);
+}
+
+/* ——— .field — file drop area ——————————————————————————————————— */
+.field {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s2);
+  width: 100%;
+  padding: var(--s8) var(--s4);
+  border: 1px dashed var(--line);
+  border-radius: var(--r2);
+  background: var(--bg);
+  color: var(--muted);
+  font: var(--t-small);
+  text-align: center;
+  cursor: pointer;
+  transition: border-color var(--transition), color var(--transition), background-color var(--transition);
+}
+
+.field:hover,
+.field:focus-visible {
+  border-color: var(--accent);
+  color: var(--text);
+  outline: none;
+}
+
+.field.is-dragover {
+  border-color: var(--accent);
+  background: var(--surface);
+  color: var(--text);
+}
+
+/* ——— .mono-panel — telemetry / diagnostics (ALL numbers mono) —— */
+.mono-panel {
+  font: var(--t-mono);
+  background: var(--surface-deep);
+  border: 1px solid var(--line);
+  border-radius: var(--r2);
+  padding: var(--s3);
+  max-height: 260px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.mono-panel .line {
+  display: block;
+  margin: 0 0 var(--s1);
+  color: var(--muted);
+}
+
+.mono-panel .line--ok {
+  color: var(--ok);
+}
+
+.mono-panel .line--err {
+  color: var(--err);
+}
+
+.mono-panel .line--warn {
+  color: var(--warn);
+}
+
+.mono-panel .line--accent {
+  color: var(--accent);
+}
+
+.mono-panel .line--info {
+  color: var(--text);
+}
+
+/* ——— .modal — consent dialog ——————————————————————————————————— */
+.modal {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(0 0 0 / 0.6);
+  z-index: 10;
+}
+
+.modal[hidden] {
+  display: none;
+}
+
+.modal__box {
+  /* .card metrics + elevation; still the one card look. */
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r2);
+  padding: var(--s6);
+  max-width: 440px;
+  box-shadow: var(--shadow-1);
+}
+
+.modal__box h3 {
+  font: var(--t-title);
+  margin: 0 0 var(--s2);
+}
+
+.modal__box p {
+  font: var(--t-body);
+  color: var(--muted);
+  margin: 0 0 var(--s4);
+}
+
+.modal__box .mono-panel {
+  max-height: 120px;
+  margin-bottom: var(--s4);
+}
+
+.modal__actions {
+  display: flex;
+  gap: var(--s3);
+  justify-content: flex-end;
+}
+
+/* ——— Rows / stats / misc ———————————————————————————————————————— */
+.row {
+  display: flex;
+  gap: var(--s3);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.stats {
+  font: var(--t-mono);
+  color: var(--muted);
+  margin: var(--s3) 0 0;
+}
+
+.preview-img {
+  display: block;
+  max-width: 100%;
+  max-height: 240px;
+  border-radius: var(--r2);
+  border: 1px solid var(--line);
+}
+
+/* Before/after slider */
+.compare {
+  position: relative;
+  max-width: 100%;
+  overflow: hidden;
+  border-radius: var(--r2);
+  border: 1px solid var(--line);
+  user-select: none;
+}
+
+.compare img {
+  display: block;
+  max-width: 100%;
+}
+
+.compare .compare__handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  cursor: ew-resize;
+}
+
+.compare .compare__handle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.compare .compare__knob {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: var(--ctl-h);
+  height: var(--s3);
+  border-radius: var(--r1);
+  background: var(--accent);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 var(--s2);
+  border-radius: var(--r1);
+  font: var(--t-mono-strong);
+}
+
+.badge--ok {
+  color: var(--ok);
+  border: 1px solid var(--ok);
+}
+
+.badge--no {
+  color: var(--err);
+  border: 1px solid var(--err);
+}
+
+/* The one accent banner (fallback notice). */
+.banner {
+  border: 1px solid var(--warn);
+  border-radius: var(--r1);
+  padding: var(--s2) var(--s3);
+  color: var(--warn);
+  font: var(--t-small);
+  margin-bottom: var(--s3);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+/* ——— Masthead ——————————————————————————————————————————————————— */
+.masthead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+}
+
+.masthead h1 {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font: var(--t-title);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 var(--s3);
+  border-radius: var(--r1);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font: var(--t-mono-strong);
+  white-space: nowrap;
+}
+
+.chip--busy {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chip--done {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.chip--err {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+/* ——— Method grid: 3 equal columns, equal rendered height ————————— */
+.grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--s3);
+}
+
+@media (max-width: 720px) {
+  .grid3 {
+    grid-template-columns: 1fr;
+  }
+}
+
+.method {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  /* Grid items refuse to shrink below min-content by default; the nowrap
+     desc would blow the 1fr tracks out of the card. Allow the ellipsis. */
+  min-width: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r2);
+  padding: var(--s3);
+  cursor: pointer;
+  font: var(--t-body);
+  color: var(--text);
+  text-align: left;
+  transition: border-color var(--transition);
+}
+
+.method:hover {
+  border-color: var(--muted);
+}
+
+.method:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.method[aria-pressed='true'] {
+  border-color: var(--accent);
+}
+
+.method[aria-pressed='true'] .method__tier {
+  color: var(--accent);
+}
+
+.method__tier {
+  font: var(--t-label);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.method__name {
+  font: var(--t-label);
+}
+
+.method__desc {
+  font: var(--t-small);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ——— Control rows: label left, control right, all --ctl-h ————————— */
+.ctl-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  flex-wrap: wrap;
+  margin-top: var(--s3);
+}
+
+.ctl-label {
+  font: var(--t-label);
+  color: var(--muted);
+}
+
+/* Card footer: mono state left, actions right. */
+.card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  border-top: 1px solid var(--line);
+  padding-top: var(--s3);
+  margin-top: var(--s4);
+}
+
+.meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  margin-top: var(--s3);
+}
+
+.meta-row .stats {
+  margin: 0;
+}
+
+.info-line {
+  font: var(--t-small);
+  color: var(--muted);
+  border-left: 2px solid var(--accent);
+  padding-left: var(--s3);
+  margin: var(--s3) 0 0;
+}
+
+/* ——— Compare: shared canvas box for both images (same scale/clip) —— */
+.compare {
+  margin-top: var(--s3);
+}
+
+.compare__scroller {
+  overflow: auto;
+  max-height: 560px;
+  border: 1px solid var(--line);
+  border-radius: var(--r2);
+  background:
+    conic-gradient(#181c22 25%, #10131a 0 50%, #181c22 0 75%, #10131a 0) 0 0 / 16px 16px;
+  user-select: none;
+}
+
+.compare__canvas {
+  position: relative;
+}
+
+.compare__img {
+  display: block;
+}
+
+.compare__clip {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+/* The result copy rides ABOVE the original inside the shared canvas; an
+   explicit pixel size is set by applyZoom() in zoom modes. */
+.compare__clip .compare__img {
+  position: absolute;
+  top: 0;
+  left: 0;
+  max-width: none;
+}
+
+.compare__label {
+  position: absolute;
+  top: var(--s2);
+  left: var(--s2);
+  padding: 0 var(--s2);
+  border-radius: var(--r1);
+  background: rgb(0 0 0 / 0.55);
+  color: var(--text);
+  font: var(--t-mono-strong);
+  pointer-events: none;
+}
+
+.compare__label--right {
+  left: auto;
+  right: var(--s2);
+}
+
+.compare__handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.compare__handle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.compare__knob {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: var(--ctl-h);
+  height: var(--s3);
+  border-radius: var(--r1);
+  background: var(--accent);
+}

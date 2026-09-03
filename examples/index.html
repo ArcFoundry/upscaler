@@ -3,149 +3,165 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>@arcfoundry/upscaler — examples</title>
-    <style>
-      :root { color-scheme: dark; }
-      * { box-sizing: border-box; }
-      body {
-        margin: 0;
-        padding: 2rem;
-        font-family: ui-sans-serif, system-ui, sans-serif;
-        background: #0b0e14;
-        color: #e6e9ef;
-        max-width: 960px;
-        margin-inline: auto;
-      }
-      h1 { font-size: 1.35rem; margin: 0 0 0.25rem; }
-      p.sub { margin: 0 0 1.5rem; color: #8b93a7; font-size: 0.9rem; }
-      section {
-        background: #121722;
-        border: 1px solid #232b3d;
-        border-radius: 10px;
-        padding: 1rem 1.25rem;
-        margin-bottom: 1rem;
-      }
-      h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.08em; color: #8b93a7; margin: 0 0 0.75rem; }
-      label { display: block; font-size: 0.8rem; color: #8b93a7; margin: 0.5rem 0 0.25rem; }
-      input[type="text"], input[type="file"], select {
-        width: 100%;
-        background: #0b0e14;
-        color: #e6e9ef;
-        border: 1px solid #2a3348;
-        border-radius: 6px;
-        padding: 0.45rem 0.6rem;
-        font-size: 0.85rem;
-      }
-      button {
-        background: #3b82f6;
-        border: none;
-        color: white;
-        font-weight: 600;
-        font-size: 0.85rem;
-        padding: 0.5rem 1rem;
-        border-radius: 6px;
-        cursor: pointer;
-        margin-top: 0.75rem;
-        margin-right: 0.5rem;
-      }
-      button:hover { background: #2563eb; }
-      button:disabled { background: #2a3348; color: #6b7488; cursor: not-allowed; }
-      button.ghost { background: transparent; border: 1px solid #2a3348; }
-      #log {
-        font-family: ui-monospace, SFMono-Regular, monospace;
-        font-size: 0.75rem;
-        line-height: 1.5;
-        white-space: pre-wrap;
-        max-height: 240px;
-        overflow-y: auto;
-        color: #9fb0c9;
-      }
-      #log .error { color: #f87171; }
-      #log .ok { color: #4ade80; }
-      #log .dim { color: #6b7488; }
-      .row { display: flex; gap: 1rem; flex-wrap: wrap; }
-      .row > div { flex: 1; min-width: 200px; }
-      table { font-size: 0.8rem; border-collapse: collapse; }
-      td { padding: 0.2rem 0.9rem 0.2rem 0; color: #c6cede; }
-      td.key { color: #8b93a7; }
-      .ok-badge { color: #4ade80; }
-      .no-badge { color: #f87171; }
-      #output {
-        max-width: 100%;
-        border-radius: 8px;
-        border: 1px solid #232b3d;
-        background:
-          conic-gradient(#1a2130 25%, #141926 0 50%, #1a2130 0 75%, #141926 0) 0 0/16px 16px;
-      }
-      .out-meta { font-size: 0.78rem; color: #8b93a7; margin-top: 0.4rem; }
-    </style>
+    <title>@arcfoundry/upscaler — engine test harness</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap"
+    />
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./styles/components.css" />
   </head>
   <body>
-    <h1>@arcfoundry/upscaler — vanilla test harness</h1>
-    <p class="sub">
-      Headless engine demo. Images never leave this device: decode, inference and encoding all run
-      in the engine's Web Worker on this page's origin.
-    </p>
+    <header class="masthead">
+      <h1>Upscaler — Engine Test Harness</h1>
+      <span class="chip" id="statusChip">idle</span>
+    </header>
+    <p class="sub">Headless engine demo. Decode, inference and encoding run in this page's Web Worker — images never leave the device.</p>
 
-    <section>
-      <h2>1 · Device</h2>
-      <button id="detect">detectDevice()</button>
-      <table id="caps" hidden></table>
-    </section>
+    <div id="fallbackBanner" class="banner" hidden></div>
 
-    <section>
-      <h2>2 · Classical (lanczos / bicubic — no model, no download)</h2>
-      <div class="row">
-        <div>
-          <label for="file">Input image</label>
-          <input type="file" id="file" accept="image/*" />
-        </div>
-        <div>
-          <label for="method">Method</label>
-          <select id="method">
-            <option value="lanczos" selected>lanczos</option>
-            <option value="bicubic">bicubic</option>
-            <option value="neural">neural (requires model)</option>
-          </select>
-        </div>
-        <div>
-          <label for="scale">Scale</label>
-          <select id="scale">
-            <option value="2" selected>2×</option>
-            <option value="4">4×</option>
-          </select>
-        </div>
-        <div>
-          <label for="format">Output format</label>
-          <select id="format">
-            <option value="image/png" selected>PNG</option>
-            <option value="image/webp">WebP</option>
-          </select>
+    <!-- INPUT -->
+    <section class="card">
+      <h2>Input</h2>
+      <div id="dropzone" class="field" role="button" tabindex="0" aria-label="Drop, paste, or click to choose an image">
+        <strong>Drop an image here</strong>
+        <span>click to browse · paste (Ctrl+V) · everything stays local</span>
+        <input type="file" id="file" accept="image/*" class="visually-hidden" />
+      </div>
+      <div id="preview" hidden>
+        <img id="previewImg" class="preview-img" alt="input preview" />
+        <div class="meta-row">
+          <span class="stats" id="inputStats"></span>
+          <button type="button" class="btn btn--ghost" id="replace" aria-label="Replace image">↺ Replace</button>
         </div>
       </div>
-      <button id="run">process()</button>
     </section>
 
-    <section>
-      <h2>3 · Neural (Real-ESRGAN — opt-in model download, Two-Gate)</h2>
-      <p class="out-meta">
-        The harness ships a catalog of third-party public test models (pinned by commit SHA — see README).
-        Clicking <strong>loadModel()</strong> IS the consent: the engine fetches the precision variant
-        selected for this hardware (WebGPU → fp16, CPU → fp32), once, then serves it from the Cache API.
+    <!-- METHOD -->
+    <section class="card">
+      <h2>Method</h2>
+      <div class="grid3" role="group" aria-label="Upscaling method">
+        <button type="button" class="method" id="method-bicubic" aria-pressed="false">
+          <span class="method__tier">Low</span>
+          <span class="method__name">Bicubic</span>
+          <span class="method__desc">Smooth resize · instant · no download · no detail gain</span>
+        </button>
+        <button type="button" class="method" id="method-lanczos" aria-pressed="true">
+          <span class="method__tier">Medium</span>
+          <span class="method__name">Lanczos</span>
+          <span class="method__desc">Crispest classical resize · instant · no download · no detail gain</span>
+        </button>
+        <button type="button" class="method" id="method-neural" aria-pressed="false">
+          <span class="method__tier">High</span>
+          <span class="method__name">Real-ESRGAN</span>
+          <span class="method__desc">Reconstructs detail with AI · one-time model download · GPU or CPU</span>
+        </button>
+      </div>
+      <div class="ctl-row">
+        <span class="ctl-label" id="scaleLabel">Scale</span>
+        <div class="seg" id="scaleSeg" role="group" aria-labelledby="scaleLabel">
+          <button type="button" data-scale="2" aria-pressed="true">2×</button>
+          <button type="button" data-scale="4" aria-pressed="false">4×</button>
+        </div>
+        <span class="ctl-label" id="formatLabel">Format</span>
+        <div class="seg" id="formatSeg" role="group" aria-labelledby="formatLabel">
+          <button type="button" data-format="image/png" aria-pressed="true">PNG</button>
+          <button type="button" data-format="image/webp" aria-pressed="false">WebP</button>
+        </div>
+        <span class="stats" id="outEstimate"></span>
+      </div>
+      <div class="card-foot">
+        <span class="stats" id="modelState">model: —</span>
+        <button type="button" class="btn btn--ghost" id="loadModel" hidden>Load model</button>
+        <button type="button" class="btn btn--primary" id="run" disabled>Run</button>
+      </div>
+    </section>
+
+    <!-- TELEMETRY -->
+    <section class="card">
+      <h2>Telemetry</h2>
+      <div class="mono-panel" id="log" aria-live="polite"></div>
+    </section>
+
+    <!-- RESULT -->
+    <section class="card" id="card-result" hidden>
+      <h2>Result</h2>
+      <div class="ctl-row">
+        <div class="seg" id="zoomSeg" role="group" aria-label="Zoom">
+          <button type="button" data-zoom="fit" aria-pressed="true">FIT</button>
+          <button type="button" data-zoom="1" aria-pressed="false">1×</button>
+          <button type="button" data-zoom="2" aria-pressed="false">2×</button>
+          <button type="button" data-zoom="4" aria-pressed="false">4×</button>
+        </div>
+      </div>
+      <div class="compare" id="compare">
+        <div class="compare__scroller">
+          <div class="compare__canvas" id="compareCanvas">
+            <img id="beforeImg" class="compare__img" alt="original" />
+            <div class="compare__clip" id="afterClip">
+              <img id="output" class="compare__img" alt="result" />
+            </div>
+            <span class="compare__label">Original</span>
+            <span class="compare__label compare__label--right">Result</span>
+            <div
+              class="compare__handle"
+              id="compareHandle"
+              role="slider"
+              tabindex="0"
+              aria-label="Before-after divider"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="50"
+            >
+              <div class="compare__knob"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="meta-row">
+        <span class="stats" id="outMeta"></span>
+        <a class="btn btn--ghost" id="download" download>⬇ Download</a>
+      </div>
+      <p class="info-line" id="classicalNote" hidden>
+        Classical resize changes geometry, not detail — switch to High (AI) to reconstruct detail.
       </p>
-      <button id="loadModel">loadModel()</button>
     </section>
 
-    <section>
-      <h2>4 · Result</h2>
-      <img id="output" alt="upscaled result" hidden />
-      <div class="out-meta" id="outMeta" hidden></div>
+    <!-- DIAGNOSTICS -->
+    <section class="card">
+      <h2>Diagnostics — which GPU actually ran it</h2>
+      <div class="ctl-row">
+        <button type="button" class="btn btn--ghost" id="detect">detectDevice()</button>
+        <div class="seg" id="gpuPicker" hidden aria-label="GPU preference">
+          <button type="button" data-gpu="high-performance" aria-pressed="true">dGPU</button>
+          <button type="button" data-gpu="low-power" aria-pressed="false">iGPU</button>
+        </div>
+      </div>
+      <div class="mono-panel" id="caps" hidden></div>
     </section>
 
-    <section>
-      <h2>Events</h2>
-      <div id="log" aria-live="polite"></div>
-    </section>
+    <!-- Consent modal (Two-Gate: one Run click → consent → load → process) -->
+    <div class="modal" id="consentModal" hidden role="dialog" aria-modal="true" aria-labelledby="consentTitle">
+      <div class="modal__box">
+        <h3 id="consentTitle">Use AI upscaling?</h3>
+        <p id="consentText">
+          Real-ESRGAN needs a one-time model download, stored in this browser's cache and reused from disk afterwards.
+          Nothing is uploaded — the model runs locally on this device.
+        </p>
+        <div class="mono-panel" id="consentDetail"></div>
+        <div class="modal__actions">
+          <button type="button" class="btn btn--ghost" id="consentCancel">Stay on Medium</button>
+          <button type="button" class="btn btn--primary" id="consentAccept">Use AI</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Stable machine-facing selectors (gates + consumers) -->
+    <input type="hidden" id="method" value="lanczos" />
+    <input type="hidden" id="scale" value="2" />
+    <input type="hidden" id="format" value="image/png" />
 
     <script type="module" src="./test.ts"></script>
   </body>

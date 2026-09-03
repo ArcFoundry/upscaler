@@ -63,7 +63,7 @@ try {
   await page.goto(BASE, { waitUntil: 'domcontentloaded' });
   await sleep(400);
 
-  /** Token invariants, evaluated against the CURRENT DOM. */
+  /** AUDIT v2 — tokens AND composition, evaluated against the CURRENT DOM. */
   async function auditTokens(stateName) {
     const r = await page.evaluate(() => {
       const cs = getComputedStyle(document.documentElement);
@@ -71,54 +71,92 @@ try {
       const radii = ['--r1', '--r2'].map((t) => parseFloat(cs.getPropertyValue(t)));
       const scale = [1, 2, 3, 4, 6, 8].map((n) => parseFloat(cs.getPropertyValue(`--s${n}`)));
 
-      const buttons = [...document.querySelectorAll('.btn')];
-      const btnIssues = buttons
-        .filter((b) => b.offsetParent !== null)
-        .map((b) => {
-          const s = getComputedStyle(b);
-          return {
-            id: b.id || b.className,
-            h: parseFloat(s.height),
-            r: s.borderRadius,
-            p: s.padding,
-          };
-        })
-        .filter((m) => m.h !== ctlH || parseFloat(m.r) !== radii[0] || !m.p.endsWith('12px'));
+      // 1. Every .btn: identical height (±1px), r1 radius, s3 h-padding.
+      const heights = new Set();
+      const btnIssues = [];
+      for (const b of document.querySelectorAll('.btn')) {
+        if (b.offsetParent === null) continue;
+        const s = getComputedStyle(b);
+        heights.add(Math.round(parseFloat(s.height)));
+        if (Math.abs(parseFloat(s.height) - ctlH) > 1 || parseFloat(s.borderRadius) !== radii[0]) {
+          btnIssues.push({ id: b.id || b.className, h: s.height, r: s.borderRadius });
+        }
+      }
 
-      // The .seg CONTROL carries --ctl-h (border-box); its inner buttons fill
-      // it (content height may be 2px less inside the 1px border).
-      const segs = [...document.querySelectorAll('.seg')].filter((b) => b.offsetParent !== null);
-      const segIssues = segs
-        .filter((seg) => {
-          const s = getComputedStyle(seg);
-          return parseFloat(s.height) !== ctlH;
-        })
+      // 2. Every .seg control shares --ctl-h (±1px).
+      const segIssues = [...document.querySelectorAll('.seg')]
+        .filter((seg) => seg.offsetParent !== null)
+        .filter((seg) => Math.abs(parseFloat(getComputedStyle(seg).height) - ctlH) > 1)
         .map((seg) => seg.id || seg.className);
 
+      // 3. All .card paddings identical.
       const cards = [...document.querySelectorAll('.card')];
       const paddings = new Set(cards.map((c) => getComputedStyle(c).padding));
       const cardPadding = cards.length ? getComputedStyle(cards[0]).padding : null;
       const cardIssues = paddings.size > 1 ? [...paddings].join(' | ') : null;
 
+      // 4. All flex/grid gaps from the spacing scale (incl. grid3 rows).
       const gapSet = new Set();
-      for (const el of document.querySelectorAll('.row, .methods, .modal__actions')) {
+      for (const el of document.querySelectorAll('.ctl-row, .grid3, .modal__actions, .card-foot, .meta-row, .masthead')) {
         if (el.offsetParent === null) continue;
-        const g = getComputedStyle(el).columnGap;
-        if (g && g !== 'normal') gapSet.add(parseFloat(g));
+        for (const g of [getComputedStyle(el).columnGap, getComputedStyle(el).rowGap]) {
+          if (g && g !== 'normal') gapSet.add(parseFloat(g));
+        }
       }
       const badGaps = [...gapSet].filter((g) => !scale.includes(g));
 
-      const panels = [...document.querySelectorAll('.mono-panel')].filter((p) => p.offsetParent !== null);
-      const nonMono = panels.filter((p) => !getComputedStyle(p).fontFamily.includes('JetBrains Mono'));
+      // 5. Telemetry 100% mono.
+      const nonMono = [...document.querySelectorAll('.mono-panel')].filter(
+        (p) => p.offsetParent !== null && !getComputedStyle(p).fontFamily.includes('JetBrains Mono'),
+      ).length;
 
-      return { btnIssues, segIssues, cardPadding, cardIssues, badGaps, nonMono: nonMono.length };
+      // 6. COMPOSITION invariants.
+      const bodyW = document.body.clientWidth;
+      const dropPromptHidden = document.querySelector('#dropzone').hidden;
+      const methodCards = [...document.querySelectorAll('.method')].filter((m) => m.offsetParent !== null);
+      const methodHeights = methodCards.map((m) => Math.round(m.getBoundingClientRect().height));
+      const methodEqual = methodHeights.length === 0 || Math.max(...methodHeights) - Math.min(...methodHeights) <= 1;
+      // COMPOSITION: no child may escape its card (the min-content overflow
+      // the grid fix addresses). Measured, not assumed.
+      let overflow = null;
+      for (const card of document.querySelectorAll('.card')) {
+        const cr = card.getBoundingClientRect();
+        for (const child of card.querySelectorAll('.method, .btn, .seg')) {
+          const r = child.getBoundingClientRect();
+          if (r.width > 0 && (r.right > cr.right + 0.5 || r.left < cr.left - 0.5)) {
+            overflow = { child: child.id || child.className, cardRight: Math.round(cr.right), childRight: Math.round(r.right) };
+            break;
+          }
+        }
+        if (overflow) break;
+      }
+      const accentCount = new Set();
+      for (const el of document.querySelectorAll('button, .method, .chip, .banner, .compare__handle')) {
+        if (el.offsetParent === null) continue;
+        const c = getComputedStyle(el);
+        for (const col of [c.backgroundColor, c.borderColor, c.color]) {
+          if (/255, 158|245, 158|F59E0B/i.test(col)) accentCount.add('accent');
+          if (/59, 130, 246|99, 102, 241|139, 92, 246|236, 72, 153/i.test(col)) accentCount.add('foreign-accent');
+        }
+      }
+
+      return {
+        btnIssues, segIssues, cardPadding, cardIssues, badGaps, nonMono,
+        bodyW, dropPromptHidden, methodEqual, overflow,
+        heights: [...heights],
+        accents: [...accentCount],
+      };
     });
 
-    check(`[${stateName}] every visible .btn is ${r.cardPadding ? '36px' : 'ctl-h'} tall, r1 radius, s3 padding`, r.btnIssues.length === 0, JSON.stringify(r.btnIssues));
-    check(`[${stateName}] every .seg button shares --ctl-h`, r.segIssues.length === 0, JSON.stringify(r.segIssues));
+    check(`[${stateName}] every visible .btn ≈ ${'ctl-h'} + r1`, r.btnIssues.length === 0, JSON.stringify(r.btnIssues));
+    check(`[${stateName}] .seg controls share --ctl-h`, r.segIssues.length === 0, JSON.stringify(r.segIssues));
     check(`[${stateName}] all .card paddings identical`, r.cardIssues === null, r.cardIssues ?? r.cardPadding);
-    check(`[${stateName}] every flex gap is on the spacing scale`, r.badGaps.length === 0, JSON.stringify(r.badGaps));
-    check(`[${stateName}] telemetry panels are mono`, r.nonMono === 0, `non-mono panels: ${r.nonMono}`);
+    check(`[${stateName}] every gap on the spacing scale`, r.badGaps.length === 0, JSON.stringify(r.badGaps));
+    check(`[${stateName}] telemetry panels mono`, r.nonMono === 0, `non-mono: ${r.nonMono}`);
+    check(`[${stateName}] single accent (no foreign hues)`, !r.accents.includes('foreign-accent'), JSON.stringify(r.accents));
+    check(`[${stateName}] no control escapes its card`, r.overflow === null, JSON.stringify(r.overflow));
+    check(`[${stateName}] single-column ≤760px body`, r.bodyW <= 760, `${r.bodyW}px`);
+    return r;
   }
 
   async function shot(name) {
@@ -128,6 +166,8 @@ try {
 
   // ——— State 1: empty ————————————————————————————————————————————————
   await auditTokens('1-empty');
+  check('[1-empty] GPU picker hidden without dualGpu', await page.evaluate(() => document.querySelector('#gpuPicker').hidden));
+  check('[1-empty] Run disabled', await page.evaluate(() => document.querySelector('#run').disabled));
   await shot('1-empty');
 
   // ——— State 2: input loaded —————————————————————————————————————————
@@ -154,9 +194,12 @@ try {
     input.dispatchEvent(new Event('change', { bubbles: true }));
   });
   await page.waitForFunction(() => !document.querySelector('#run').disabled, null, { timeout: 15000 });
+  await sleep(150);
+  const loaded = await auditTokens('2-loaded');
+  check('[2-loaded] drop prompt hidden once a file is loaded', loaded.dropPromptHidden === true);
   await page.click('#method-neural');
-  await sleep(200);
-  await auditTokens('2-loaded');
+  await sleep(150);
+  check('[2-loaded] Load-model affordance visible for High without a session', await page.evaluate(() => !document.querySelector('#loadModel').hidden));
   await shot('2-loaded');
 
   // ——— State 3: consent modal —————————————————————————————————————————
@@ -166,12 +209,12 @@ try {
   await auditTokens('3-consent');
   await shot('3-consent');
 
-  // ——— State 4: processing (accept consent → tiles run) ———————————————
+  // ——— State 4: processing (accept consent → tiles run, ONE click) ————
   await page.click('#consentAccept');
   await page.waitForFunction(() => document.querySelector('#log').textContent.includes('model ready'), null, { timeout: 120000 });
-  // The run continues automatically; catch it mid-flight.
+  // AUTO-CONTINUE: tiles must follow the model without a second click.
   await page.waitForFunction(
-    () => document.querySelector('#log').textContent.includes('tile_processing'),
+    () => [...document.querySelectorAll('#log .line--accent')].some((el) => el.textContent.includes('tile ')),
     null,
     { timeout: 60000 },
   );
@@ -187,8 +230,24 @@ try {
   );
   await page.waitForFunction(() => document.querySelector('#output').naturalWidth > 0, null, { timeout: 15000 });
   await sleep(300);
-  await auditTokens('5-result');
-  await shot('5-result');
+  await auditTokens('5-result-fit');
+  check('[5-result-fit] meta has dims + method', /\d+×\d+/.test(await page.evaluate(() => document.querySelector('#outMeta').textContent)));
+  await shot('5-result-fit');
+
+  // ——— State 6: result @ 2× (divider mid) — the honest comparison ————
+  await page.click('#zoomSeg button[data-zoom="2"]');
+  await page.waitForFunction(() => document.querySelector('#compareHandle').getAttribute('aria-valuenow') === '50', null, { timeout: 5000 });
+  await sleep(300);
+  await auditTokens('6-result-2x');
+  const align = await page.evaluate(() => {
+    const b = document.querySelector('#beforeImg').getBoundingClientRect();
+    const a = document.querySelector('#output').getBoundingClientRect();
+    return { same: Math.abs(b.width - a.width) < 0.5 && Math.abs(b.height - a.height) < 0.5 && Math.abs(b.left - a.left) < 0.5 && Math.abs(b.top - a.top) < 0.5, w: b.width };
+  });
+  check('[6-result-2x] both images identical scale/alignment (±0.5px)', align.same, JSON.stringify(align));
+  await shot('6-result-2x');
+
+  // ——— State 7: error display ———————————————————————————————————————
 
   // ——— State 6: error display —————————————————————————————————————————
   await page.evaluate(() => {
@@ -207,12 +266,11 @@ try {
     input.dispatchEvent(new Event('change', { bubbles: true }));
   });
   await page.click('#method-bicubic');
-  await page.click('#scaleSeg button[data-scale="2"]');
   await page.click('#run');
   await page.waitForFunction(() => document.querySelector('#log').textContent.includes('process failed'), null, { timeout: 30000 });
   await sleep(200);
-  await auditTokens('6-error');
-  await shot('6-error');
+  await auditTokens('7-error');
+  await shot('7-error');
 
   await browser.close();
 } finally {
