@@ -4,10 +4,9 @@
  *
  * Tiling scheme
  * -------------
- * Tiles are `tile × tile` (512², or 256² when `lowVram`) sampled with
- * `OVERLAP` (16px) of extra context on every interior side, so the model
- * sees real content beyond each seam. The context is what prevents seams;
- * the blend is what hides the transition:
+ * Tiles are `tile × tile` sampled with `overlap` px of extra context on
+ * every interior side, so the model sees real content beyond each seam. The
+ * context is what prevents seams; the blend is what hides the transition:
  *
  *  - Each tile's output covers its full rect (core + margins), scaled.
  *  - Margins on image borders have weight 1 (no neighbor to blend with).
@@ -20,26 +19,88 @@
  *
  * This keeps extra memory at O(output/8) (a written-bitset) instead of
  * O(output × float) for a sum/weight accumulator.
+ *
+ * v0.3.0: tile size / overlap / concurrency follow the HONESTLY-LABELED gpu
+ * tier heuristic (`gpuTier` in Capabilities) — see `tilePolicyFor`. Per-tile
+ * DURATION and a running ETA are reported on tile COMPLETION (additive
+ * optional fields on the existing `tile_processing` event; the first tile's
+ * duration includes model warmup — expected and documented).
  */
 
 import type { Capabilities } from './DeviceRouter.js';
 import type { ModelManager } from './ModelManager.js';
 
-/** Context pixels sampled beyond each interior tile edge (source pixels). */
+/** Default context pixels sampled beyond each interior tile edge (source px). */
 export const TILE_OVERLAP = 16;
+/** Larger context budget for 'high'-tier adapters. */
+export const HIGH_TIER_OVERLAP = 24;
 
 const TILE_SIZE = 512;
 const TILE_SIZE_LOW_VRAM = 256;
 
-/** Hard concurrency caps per execution provider. */
-const MAX_CONCURRENT_TILES_WEBGPU = 4;
-const MAX_CONCURRENT_TILES_WASM = 8;
-
 /** How the worker runs one 4x neural tile. */
 export type NeuralTileRunner = (tile: ImageData) => Promise<ImageData>;
 
-/** Per-tile progress relayed out of the worker. */
-export type TileProgressSink = (tileIndex: number, totalTiles: number) => void;
+/**
+ * Per-tile telemetry relayed out of the worker. Fired on tile COMPLETION:
+ * `tileDurationMs` is the duration of the tile just completed (first tile
+ * includes warmup), `etaMs` the running-average estimate for the rest.
+ */
+export interface TileProgressInfo {
+  tileIndex: number;
+  totalTiles: number;
+  tileDurationMs?: number;
+  etaMs?: number;
+}
+
+export type TileProgressSink = (info: TileProgressInfo) => void;
+
+/** Compute policy for one neural run, derived from the gpu tier heuristic. */
+export interface TilePolicy {
+  tileSize: number;
+  overlap: number;
+  concurrency: number;
+}
+
+/**
+ * Tier-driven tile policy (HEURISTIC — inputs are labeled in Capabilities):
+ *   software/entry → 256 px, concurrency 2 (conservative)
+ *   mid            → 512 px, concurrency 4
+ *   high           → 512 px, concurrency 4, larger overlap budget
+ * `lowVram` still overrides downward (256 px / 2 / default overlap). On the
+ * WASM EP the tier concurrency is additionally clamped by hardware threads.
+ * Unknown tier ⇒ 'entry' (conservative). Pure; exported for tests.
+ */
+export function tilePolicyFor(
+  capabilities: Pick<Capabilities, 'lowVram' | 'gpuTier' | 'webgpu'>,
+  hardwareConcurrency = 4,
+): TilePolicy {
+  const tier = capabilities.gpuTier ?? 'entry';
+  let policy: TilePolicy;
+  switch (tier) {
+    case 'high':
+      policy = { tileSize: TILE_SIZE, overlap: HIGH_TIER_OVERLAP, concurrency: 4 };
+      break;
+    case 'mid':
+      policy = { tileSize: TILE_SIZE, overlap: TILE_OVERLAP, concurrency: 4 };
+      break;
+    default:
+      // 'software', 'entry', and any unrecognized tier: conservative.
+      policy = { tileSize: TILE_SIZE_LOW_VRAM, overlap: TILE_OVERLAP, concurrency: 2 };
+      break;
+  }
+  if (capabilities.lowVram) {
+    policy = {
+      tileSize: Math.min(policy.tileSize, TILE_SIZE_LOW_VRAM),
+      overlap: Math.min(policy.overlap, TILE_OVERLAP),
+      concurrency: Math.min(policy.concurrency, 2),
+    };
+  }
+  if (!capabilities.webgpu) {
+    policy = { ...policy, concurrency: Math.min(policy.concurrency, Math.max(1, hardwareConcurrency)) };
+  }
+  return policy;
+}
 
 interface TileJob {
   index: number;
@@ -49,19 +110,22 @@ interface TileJob {
 }
 
 export class TileProcessor {
-  readonly #onTileStart: TileProgressSink;
+  readonly #onTile: TileProgressSink;
 
-  constructor(onTileStart: TileProgressSink) {
-    this.#onTileStart = onTileStart;
+  constructor(onTile: TileProgressSink) {
+    this.#onTile = onTile;
   }
 
   /**
    * Processes `image` with the tiled Real-ESRGAN pipeline at the model's
-   * fixed 4x. Returns the full upscaled image.
+   * fixed 4x. Returns the full upscaled image. One `tile_processing`
+   * notification fires PER COMPLETED TILE with its duration and the running
+   * ETA (average over completed tiles × remaining ÷ concurrency).
    */
   async processNeural(image: ImageData, capabilities: Capabilities, model: ModelManager): Promise<ImageData> {
-    const tileSize = capabilities.lowVram ? TILE_SIZE_LOW_VRAM : TILE_SIZE;
-    const core = tileSize - 2 * TILE_OVERLAP;
+    const hw = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4;
+    const { tileSize, overlap, concurrency } = tilePolicyFor(capabilities, hw);
+    const core = tileSize - 2 * overlap;
     const scale = 4;
 
     const { width: W, height: H } = image;
@@ -83,10 +147,19 @@ export class TileProcessor {
     }
 
     let next = 0;
-    const hw = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency || 4 : 4;
-    const concurrency = capabilities.webgpu
-      ? MAX_CONCURRENT_TILES_WEBGPU
-      : Math.min(hw, MAX_CONCURRENT_TILES_WASM);
+    const durations: number[] = [];
+
+    const emitComplete = (index: number, durationMs: number): void => {
+      durations.push(durationMs);
+      const avg = durations.reduce((a, b) => a + b, 0) / durations.length;
+      const remaining = total - durations.length;
+      this.#onTile({
+        tileIndex: index,
+        totalTiles: total,
+        tileDurationMs: Math.round(durationMs),
+        etaMs: remaining > 0 ? Math.round((avg * remaining) / concurrency) : 0,
+      });
+    };
 
     const worker = async (): Promise<void> => {
       for (;;) {
@@ -95,10 +168,11 @@ export class TileProcessor {
           return;
         }
         const job = jobs[i]!;
-        this.#onTileStart(job.index, total);
-        const tile = this.#extractTile(image, job.x0, job.y0, tileSize);
+        const t0 = performance.now();
+        const tile = this.#extractTile(image, job.x0, job.y0, tileSize, overlap);
         const upscaled = await this.#inferTile(tile, model);
-        this.#composite(out, written, upscaled, job.x0, job.y0, W, H, core, scale);
+        this.#composite(out, written, upscaled, job.x0, job.y0, W, H, core, scale, overlap);
+        emitComplete(job.index, performance.now() - t0);
       }
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
@@ -108,13 +182,13 @@ export class TileProcessor {
 
   /**
    * Extracts a `tileSize × tileSize` source rect centered on the core at
-   * (`x0`, `y0`), with `TILE_OVERLAP` context on interior sides, clamped to
-   * the image. Interior edges keep full context; image-border edges are
-   * clamped away (no fabricated pixels).
+   * (`x0`, `y0`), with `overlap` context on interior sides, clamped to the
+   * image. Interior edges keep full context; image-border edges are clamped
+   * away (no fabricated pixels).
    */
-  #extractTile(image: ImageData, x0: number, y0: number, tileSize: number): ImageData {
-    const rectX = Math.max(0, x0 - TILE_OVERLAP);
-    const rectY = Math.max(0, y0 - TILE_OVERLAP);
+  #extractTile(image: ImageData, x0: number, y0: number, tileSize: number, overlap: number): ImageData {
+    const rectX = Math.max(0, x0 - overlap);
+    const rectY = Math.max(0, y0 - overlap);
     const rectW = Math.min(tileSize, image.width - rectX);
     const rectH = Math.min(tileSize, image.height - rectY);
 
@@ -151,12 +225,13 @@ export class TileProcessor {
     srcH: number,
     core: number,
     scale: number,
+    overlap: number,
   ): void {
     const outW = srcW * scale;
     const outH = srcH * scale;
 
-    const rectX = Math.max(0, x0 - TILE_OVERLAP);
-    const rectY = Math.max(0, y0 - TILE_OVERLAP);
+    const rectX = Math.max(0, x0 - overlap);
+    const rectY = Math.max(0, y0 - overlap);
     const rectW = Math.min(tile.width, srcW - rectX);
     const rectH = Math.min(tile.height, srcH - rectY);
 
@@ -166,7 +241,7 @@ export class TileProcessor {
     const destH = rectH * scale;
 
     // Feather width in output pixels; only interior sides feather.
-    const feather = TILE_OVERLAP * scale;
+    const feather = overlap * scale;
     const hasLeft = x0 > 0;
     const hasTop = y0 > 0;
     const hasRight = x0 + core < srcW;

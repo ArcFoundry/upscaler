@@ -5,15 +5,21 @@
  * (`src/worker.ts` is a separate tsup entry producing `dist/worker.js`), so
  * no in-browser TypeScript compilation is ever needed.
  *
- * Protocol: one operation at a time (`load-model` or `process`), each with a
- * configurable timeout. Every request carries an id; the worker answers with
- * progress/fallback events, then exactly one terminal `ready`/`done`/`error`.
- * Image bytes cross the boundary as zero-copy transferables.
+ * Protocol: one operation at a time (`load-model` or `process`), each with
+ * v0.3.0 timeout semantics — an INACTIVITY timeout reset by every worker
+ * message (progress/fallback/heartbeat) for the operation, plus an optional
+ * absolute `hardTimeoutMs` cap. A progressing worker is never killed by the
+ * idle limit; a silent worker dies with the same TIMEOUT error as before.
+ * Every request carries an id; the worker answers with
+ * progress/fallback/heartbeat events, then exactly one terminal
+ * `ready`/`done`/`error`. Image bytes cross the boundary as zero-copy
+ * transferables.
  */
 
 import type { OutputFormat } from './Codec.js';
 import type { Capabilities } from './DeviceRouter.js';
 import { UpscalerError, upscalerErrorFromWire, type UpscalerErrorCode } from './errors.js';
+import { TimeoutGovernor, type TimeoutExpireReason } from './Timeouts.js';
 
 /** The processing methods the engine supports. */
 export type Method = 'lanczos' | 'bicubic' | 'neural';
@@ -25,6 +31,8 @@ export interface LoadModelParams {
   models?: { webgpu?: string; wasm?: string };
   capabilities: Capabilities;
   ortWasmPaths?: string;
+  /** Rebuild the session even when the selected URL is unchanged (GPU picker). */
+  forceReload?: boolean;
 }
 
 export interface ProcessParams {
@@ -42,16 +50,33 @@ export type WorkerRequest =
   | ({ id: number; kind: 'load-model' } & LoadModelParams)
   | ({ id: number; kind: 'process' } & ProcessParams);
 
+/**
+ * Internal main↔worker protocol. NOT the public event union (that is frozen;
+ * see EventEmitter.ts) — these fields are plumbing.
+ */
 export type WorkerResponse =
+  | { kind: 'heartbeat'; id: number }
   | { kind: 'model_download'; id: number; progress: number }
-  | { kind: 'tile_processing'; id: number; tileIndex: number; totalTiles: number }
+  | { kind: 'tile_processing'; id: number; tileIndex: number; totalTiles: number; tileDurationMs?: number; etaMs?: number }
   | { kind: 'fallback'; id: number; reason: string; swappedTo?: 'wasm-variant' | 'same-file' }
-  | { kind: 'ready'; id: number; variant: 'webgpu' | 'wasm'; url: string; cached: boolean }
+  | {
+      kind: 'ready';
+      id: number;
+      variant: 'webgpu' | 'wasm';
+      url: string;
+      cached: boolean;
+      reason?: string;
+      requestedEp: 'webgpu' | 'wasm';
+      actualEp: 'webgpu' | 'wasm';
+    }
   | { kind: 'done'; id: number; blob: Blob }
   | { kind: 'error'; id: number; code: UpscalerErrorCode; message: string; recoverable: boolean };
 
-/** Events the engine re-emits; lifecycle results stay internal. */
-export type ForwardableWorkerEvent = Extract<WorkerResponse, { kind: 'model_download' | 'tile_processing' | 'fallback' | 'error' }>;
+/** Events the engine re-emits; lifecycle results and heartbeats stay internal. */
+export type ForwardableWorkerEvent = Extract<
+  WorkerResponse,
+  { kind: 'model_download' | 'tile_processing' | 'fallback' | 'error' }
+>;
 
 export interface WorkerControllerCallbacks {
   /** Progress, fallback and error events, for the engine to re-emit. */
@@ -60,23 +85,33 @@ export interface WorkerControllerCallbacks {
   onWorkerDied(): void;
 }
 
+export interface WorkerTimeoutOptions {
+  /** INACTIVITY limit in ms — reset by every worker message for the op. */
+  idleMs: number;
+  /** Optional absolute cap overriding idle logic. Undefined = disabled. */
+  hardMs?: number;
+}
+
 interface Pending {
   id: number;
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
+  governor: TimeoutGovernor;
 }
 
 export class WorkerController {
   readonly #callbacks: WorkerControllerCallbacks;
-  readonly #timeout: number;
+  readonly #timeout: WorkerTimeoutOptions;
   #worker: Worker | null = null;
   #nextId = 1;
   #pending: Pending | null = null;
 
-  constructor(callbacks: WorkerControllerCallbacks, timeout: number) {
-    if (!Number.isFinite(timeout) || timeout <= 0) {
-      throw new UpscalerError('INVALID_INPUT', `timeout must be a positive number of milliseconds, got ${timeout}.`);
+  constructor(callbacks: WorkerControllerCallbacks, timeout: WorkerTimeoutOptions) {
+    if (!Number.isFinite(timeout.idleMs) || timeout.idleMs <= 0) {
+      throw new UpscalerError('INVALID_INPUT', `idle timeout must be a positive number of milliseconds, got ${timeout.idleMs}.`);
+    }
+    if (timeout.hardMs !== undefined && (!Number.isFinite(timeout.hardMs) || timeout.hardMs <= 0)) {
+      throw new UpscalerError('INVALID_INPUT', `hardTimeoutMs must be a positive number of milliseconds or undefined, got ${String(timeout.hardMs)}.`);
     }
     this.#callbacks = callbacks;
     this.#timeout = timeout;
@@ -87,11 +122,21 @@ export class WorkerController {
     return this.#pending !== null;
   }
 
-  loadModel(params: LoadModelParams): Promise<{ variant: 'webgpu' | 'wasm'; url: string; cached: boolean }> {
+  loadModel(params: LoadModelParams): Promise<{
+    variant: 'webgpu' | 'wasm';
+    url: string;
+    cached: boolean;
+    reason?: string;
+    requestedEp: 'webgpu' | 'wasm';
+    actualEp: 'webgpu' | 'wasm';
+  }> {
     return this.#run((id) => [{ id, kind: 'load-model', ...params }, [] as Transferable[]]) as Promise<{
       variant: 'webgpu' | 'wasm';
       url: string;
       cached: boolean;
+      reason?: string;
+      requestedEp: 'webgpu' | 'wasm';
+      actualEp: 'webgpu' | 'wasm';
     }>;
   }
 
@@ -116,7 +161,7 @@ export class WorkerController {
   dispose(): void {
     if (this.#pending) {
       const pending = this.#pending;
-      clearTimeout(pending.timer);
+      pending.governor.stop();
       this.#pending = null;
       pending.reject(
         new UpscalerError('DESTROYED', 'The engine was destroyed while an operation was in progress.', {
@@ -142,13 +187,14 @@ export class WorkerController {
     }
     const id = this.#nextId++;
     return new Promise<unknown>((resolve, reject) => {
-      const pending: Pending = {
-        id,
-        resolve,
-        reject,
-        timer: setTimeout(() => this.#onTimeout(id), this.#timeout),
-      };
+      const governor = new TimeoutGovernor({
+        idleMs: this.#timeout.idleMs,
+        hardMs: this.#timeout.hardMs,
+        onExpire: (reason) => this.#onTimeout(id, reason),
+      });
+      const pending: Pending = { id, resolve, reject, governor };
       this.#pending = pending;
+      governor.start();
       let worker: Worker;
       try {
         worker = this.#ensureWorker();
@@ -189,17 +235,31 @@ export class WorkerController {
   }
 
   #onMessage(message: WorkerResponse): void {
+    // ANY message for the pending operation is proof of life — reset the
+    // idle timer before anything else (v0.3.0 timeout semantics).
+    if (this.#pending && message.id === this.#pending.id) {
+      this.#pending.governor.poke();
+    }
     if (!this.#pending || message.id !== this.#pending.id) {
       return; // stale response from a previous (timed-out) operation
     }
     switch (message.kind) {
+      case 'heartbeat':
+        return; // proof of life only — not forwarded, not the public union
       case 'model_download':
       case 'tile_processing':
       case 'fallback':
         this.#callbacks.onEvent(message);
         return;
       case 'ready':
-        this.#settle(message.id, { variant: message.variant, url: message.url, cached: message.cached });
+        this.#settle(message.id, {
+          variant: message.variant,
+          url: message.url,
+          cached: message.cached,
+          ...(message.reason !== undefined ? { reason: message.reason } : {}),
+          requestedEp: message.requestedEp,
+          actualEp: message.actualEp,
+        });
         return;
       case 'done':
         this.#settle(message.id, message.blob);
@@ -211,18 +271,18 @@ export class WorkerController {
     }
   }
 
-  #onTimeout(id: number): void {
+  #onTimeout(id: number, reason: TimeoutExpireReason): void {
     const pending = this.#pending;
     if (!pending || pending.id !== id) {
       return;
     }
     this.#killWorker();
-    const error = upscalerErrorFromWire(
-      'TIMEOUT',
-      `Operation timed out after ${this.#timeout} ms and the worker was terminated. ` +
-        'If the input is very large, raise the timeout or lower the input size.',
-      false,
-    );
+    const message =
+      reason === 'hard'
+        ? `Operation exceeded the absolute hardTimeoutMs cap (${this.#timeout.hardMs} ms) and the worker was terminated, despite making progress. Raise hardTimeoutMs or reduce the input size.`
+        : `No worker activity for ${this.#timeout.idleMs} ms (inactivity timeout) and the worker was terminated. ` +
+          'If a single inference step is legitimately slower than this, raise the timeout — progress resets it.';
+    const error = upscalerErrorFromWire('TIMEOUT', message, false);
     this.#callbacks.onEvent({ kind: 'error', id, code: 'TIMEOUT', message: error.message, recoverable: false });
     this.#settle(id, undefined, error);
   }
@@ -256,7 +316,7 @@ export class WorkerController {
     if (!pending || pending.id !== id) {
       return;
     }
-    clearTimeout(pending.timer);
+    pending.governor.stop();
     this.#pending = null;
     if (error) {
       pending.reject(error);

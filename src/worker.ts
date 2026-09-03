@@ -10,6 +10,10 @@
  *    main thread).
  *  - Stream progress and fallback events back, then answer exactly once
  *    with `done`/`error`.
+ *  - v0.3.0: emit an internal `heartbeat` every 10 s while ANY operation is
+ *    in flight, so the main thread's INACTIVITY timeout never false-triggers
+ *    during legitimately quiet phases (session compilation, blending,
+ *    encoding). Heartbeats are protocol plumbing — not the public union.
  *
  * Two distinct WASM file families live here — never conflate them:
  *  1. The Rust scalers, committed at `src/wasm/` and copied to `dist/wasm/`,
@@ -21,7 +25,6 @@
 import initUpscalerWasm, { WasmScalerJob } from './wasm/upscaler_wasm.js';
 
 import { Codec, type OutputFormat } from './Codec.js';
-import { DeviceRouter, type Capabilities } from './DeviceRouter.js';
 import { ModelManager } from './ModelManager.js';
 import { TileProcessor } from './TileProcessor.js';
 import { UpscalerError } from './errors.js';
@@ -38,12 +41,6 @@ function initWasm(): Promise<void> {
   return wasmReady;
 }
 
-let capabilities: Capabilities | null = null;
-async function getCapabilities(): Promise<Capabilities> {
-  capabilities ??= await new DeviceRouter().getCapabilities();
-  return capabilities;
-}
-
 interface WorkerState {
   model: ModelManager;
   tiles: TileProcessor;
@@ -56,10 +53,17 @@ function getState(): WorkerState {
   if (!state) {
     const model = new ModelManager({
       onDownloadProgress: (progress) => emit({ kind: 'model_download', id: currentId, progress }),
-      onFallback: (reason) => emit({ kind: 'fallback', id: currentId, reason }),
+      onFallback: (reason, swappedTo) => emit({ kind: 'fallback', id: currentId, reason, swappedTo }),
     });
-    const tiles = new TileProcessor((tileIndex, totalTiles) =>
-      emit({ kind: 'tile_processing', id: currentId, tileIndex, totalTiles }),
+    const tiles = new TileProcessor((info) =>
+      emit({
+        kind: 'tile_processing',
+        id: currentId,
+        tileIndex: info.tileIndex,
+        totalTiles: info.totalTiles,
+        ...(info.tileDurationMs !== undefined ? { tileDurationMs: info.tileDurationMs } : {}),
+        ...(info.etaMs !== undefined ? { etaMs: info.etaMs } : {}),
+      }),
     );
     state = { model, tiles };
   }
@@ -68,6 +72,24 @@ function getState(): WorkerState {
 
 function emit(message: WorkerResponse): void {
   (self as unknown as { postMessage: (m: WorkerResponse) => void }).postMessage(message);
+}
+
+/**
+ * Proof-of-life ticker for the in-flight operation. 10 s << any sane idle
+ * timeout, and every tick resets it — session compilation, encoding and
+ * blending silence can never kill a healthy run.
+ */
+const HEARTBEAT_MS = 10_000;
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+function startHeartbeat(): void {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => emit({ kind: 'heartbeat', id: currentId }), HEARTBEAT_MS);
+}
+function stopHeartbeat(): void {
+  if (heartbeatTimer !== null) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
 }
 
 /**
@@ -119,6 +141,7 @@ async function runNeural(
   image: ImageData,
   scale: 2 | 4,
   format: OutputFormat,
+  capabilities: import('./DeviceRouter.js').Capabilities,
   quality?: number,
 ): Promise<Blob> {
   const { model, tiles } = getState();
@@ -142,7 +165,7 @@ async function runNeural(
     );
   }
 
-  const upscaled = await tiles.processNeural(image, await getCapabilities(), model);
+  const upscaled = await tiles.processNeural(image, capabilities, model);
 
   // scale 2 = 4x then Lanczos-downscale to 2x (documented contract).
   if (scale === 2) {
@@ -187,26 +210,39 @@ async function runProcess(message: Extract<WorkerRequest, { kind: 'process' }>):
 
   switch (message.method) {
     case 'lanczos':
-    case 'bicubic':
+    case 'bicubic': {
       // Classical methods are NOT tiled: one WASM call processes the full
-      // image. Report honest granularity — a single tile.
-      emit({ kind: 'tile_processing', id: currentId, tileIndex: 0, totalTiles: 1 });
-      return runClassical(image, message.method, message.scale, message.format, message.quality);
-    case 'neural':
+      // image. The single tile_processing event fires on COMPLETION with its
+      // duration (v0.3.0 telemetry; honest granularity — one step).
+      const t0 = performance.now();
+      const blob = await runClassical(image, message.method, message.scale, message.format, message.quality);
+      emit({
+        kind: 'tile_processing',
+        id: currentId,
+        tileIndex: 0,
+        totalTiles: 1,
+        tileDurationMs: Math.round(performance.now() - t0),
+      });
+      return blob;
+    }
+    case 'neural': {
       runningMaxDimension = message.maxDimension;
-      return runNeural(image, message.scale, message.format, message.quality);
+      return runNeural(image, message.scale, message.format, message.capabilities, message.quality);
+    }
   }
 }
 
 async function handle(message: WorkerRequest): Promise<void> {
   switch (message.kind) {
     case 'load-model': {
-      const caps = await getCapabilities();
+      // Capabilities were probed on the main thread with the consumer's
+      // gpuPreference — reuse them (one source of truth, no re-probe here).
       const result = await getState().model.loadModel({
         modelUrl: message.modelUrl,
         models: message.models,
-        capabilities: caps,
+        capabilities: message.capabilities,
         ortWasmPaths: message.ortWasmPaths,
+        ...(message.forceReload ? { forceReload: true } : {}),
       });
       emit({ kind: 'ready', id: message.id, ...result });
       return;
@@ -224,5 +260,8 @@ self.onmessage = (event: MessageEvent<WorkerRequest>): void => {
   currentId = message.id;
   // Requests are strictly serialized by WorkerController, so a module-level
   // "current request id" is safe for attributing streamed events.
-  void handle(message).catch(() => undefined); // handle() emits `error` itself
+  startHeartbeat();
+  void handle(message)
+    .catch(() => undefined) // handle() emits `error` itself
+    .finally(() => stopHeartbeat());
 };

@@ -14,9 +14,23 @@ export type ModelDownloadEvent = {
 
 export type TileProcessingEvent = {
   type: 'tile_processing';
-  /** Zero-based index of the tile that started processing. */
+  /**
+   * Zero-based index of the tile this event reports. v0.3.0: neural events
+   * fire when a tile COMPLETES (so duration/ETA refer to it); classical
+   * methods fire once, on their single completion step.
+   */
   tileIndex: number;
   totalTiles: number;
+  /**
+   * v0.3.0, additive optional: duration of the tile just completed (ms).
+   * The first tile's duration includes model warmup — expected.
+   */
+  tileDurationMs?: number;
+  /**
+   * v0.3.0, additive optional: running-average estimate for the remaining
+   * tiles (average completed duration × remaining ÷ concurrency), in ms.
+   */
+  etaMs?: number;
 };
 
 export type FallbackEvent = {
@@ -24,6 +38,11 @@ export type FallbackEvent = {
   from: 'webgpu';
   to: 'wasm';
   reason: string;
+  /**
+   * v0.3.0, additive optional: which file the retrying session uses — the
+   * catalog's wasm variant, or the same file when no variant exists.
+   */
+  swappedTo?: 'wasm-variant' | 'same-file';
 };
 
 export type CompleteEvent = {

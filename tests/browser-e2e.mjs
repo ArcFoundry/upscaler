@@ -69,15 +69,12 @@ try {
 
   await page.click('#detect');
   await page.waitForSelector('#caps:not([hidden])', { timeout: 15000 });
-  const caps = await page.evaluate(() => {
-    const rows = [...document.querySelectorAll('#caps tr')];
-    return Object.fromEntries(rows.map((r) => [r.children[0].textContent, r.children[1].textContent]));
-  });
-  check('detectDevice() renders wasm=true', caps.wasm === 'true', JSON.stringify(caps));
-  check('detectDevice() renders all four capability keys', 'webgpu' in caps && 'wasmThreads' in caps && 'lowVram' in caps);
+  const capsText = await page.evaluate(() => document.querySelector('#caps').textContent);
+  check('detectDevice() renders wasm=true', /wasm:\s*true/.test(capsText), capsText);
+  check('detectDevice() renders all four capability keys', /webgpu:/.test(capsText) && /threads:/.test(capsText) && /lowVram:/.test(capsText));
 
   // Two-Gate: neural before loadModel() throws a typed error.
-  await page.selectOption('#method', 'neural');
+  await page.click('#method-neural');
   await page.evaluate(async () => {
     const canvas = document.createElement('canvas');
     canvas.width = 64;
@@ -92,20 +89,32 @@ try {
     const dt = new DataTransfer();
     dt.items.add(new File([blob], 'gradient.png', { type: 'image/png' }));
     document.querySelector('#file').files = dt.files;
+    document.querySelector('#file').dispatchEvent(new Event('change', { bubbles: true }));
   });
+  await page.waitForFunction(() => !document.querySelector('#run').disabled, null, { timeout: 15000 });
   await page.click('#run');
   await page.waitForFunction(() => document.querySelector('#log')?.textContent.includes('process failed'), null, { timeout: 15000 });
   check(
     'neural without loadModel() throws typed Two-Gate error',
     await page.evaluate(() => document.querySelector('#log').textContent.includes('requires a prior loadModel')),
   );
+  check(
+    'Two-Gate consent modal opens on the typed error',
+    await page.evaluate(() => !document.querySelector('#consentModal').hidden),
+  );
+  // Decline — the run must stay download-free.
+  await page.click('#consentCancel');
+  check(
+    'declining consent keeps the run download-free',
+    await page.evaluate(() => document.querySelector('#log').textContent.includes('model download declined')),
+  );
 
   // Classical lanczos 2x.
-  await page.selectOption('#method', 'lanczos');
-  await page.selectOption('#scale', '2');
+  await page.click('#method-lanczos');
+  await page.click('#scaleSeg button[data-scale="2"]');
   await page.click('#run');
   await page.waitForFunction(
-    () => [...document.querySelectorAll('#log .ok')].some((el) => el.textContent === 'complete'),
+    () => [...document.querySelectorAll('#log .line--ok')].some((el) => el.textContent.endsWith('complete')),
     null,
     { timeout: 60000 },
   );
@@ -121,11 +130,11 @@ try {
   );
 
   // Bicubic 4x.
-  await page.selectOption('#method', 'bicubic');
-  await page.selectOption('#scale', '4');
+  await page.click('#method-bicubic');
+  await page.click('#scaleSeg button[data-scale="4"]');
   await page.click('#run');
   await page.waitForFunction(
-    () => [...document.querySelectorAll('#log .ok')].filter((el) => el.textContent === 'complete').length >= 2,
+    () => [...document.querySelectorAll('#log .line--ok')].filter((el) => el.textContent.endsWith('complete')).length >= 2,
     null,
     { timeout: 60000 },
   );

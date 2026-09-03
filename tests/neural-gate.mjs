@@ -94,7 +94,24 @@ async function clickLoadModel(page) {
       new Promise((resolve) => {
         const logEl = document.querySelector('#log');
         const before = logEl.textContent.length;
-        document.querySelector('#loadModel').click();
+        // Consent modal flow: if the modal is already open (e.g. it opened on
+        // the Two-Gate typed error), accept it directly; otherwise open it
+        // via #loadModel, then accept. Accepting IS the consent.
+        const modal = document.querySelector('#consentModal');
+        if (modal && !modal.hidden) {
+          document.querySelector('#consentAccept').click();
+        } else {
+          document.querySelector('#loadModel').click();
+          const acceptWhenOpen = () => {
+            const m = document.querySelector('#consentModal');
+            if (m && !m.hidden) {
+              document.querySelector('#consentAccept').click();
+            } else {
+              setTimeout(acceptWhenOpen, 50);
+            }
+          };
+          setTimeout(acceptWhenOpen, 50);
+        }
         const obs = new MutationObserver(() => {
           const text = logEl.textContent.slice(before);
           const m = text.match(/model ready — variant=(\w+) cached=(\w+)/);
@@ -136,7 +153,9 @@ async function injectTestImage(page) {
     const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
     const dt = new DataTransfer();
     dt.items.add(new File([blob], 'synthetic-96.png', { type: 'image/png' }));
-    document.querySelector('#file').files = dt.files;
+    const input = document.querySelector('#file');
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
   });
 }
 
@@ -144,15 +163,15 @@ async function injectTestImage(page) {
  * imageStats are luminance stats of the CURRENT output img at completion.
  * Polls the harness log from Node (no waitForFunction) and dumps state on stall. */
 async function runProcess(page, method, scale, timeoutMs = 300000) {
-  await page.selectOption('#method', method);
-  await page.selectOption('#scale', String(scale));
+  await page.click(`#method-${method}`);
+  await page.click(`#scaleSeg button[data-scale="${scale}"]`);
   // Markers are DELTAS over the pre-click log: '#log .ok' also holds the
   // 'model ready' line, and the log keeps stale 'process failed' lines from
   // earlier checks (e.g. the Two-Gate probe), so absolute substring scans
   // would both miss the target and fire on old failures.
   const marker = await page.evaluate(() => ({
-    complete: [...document.querySelectorAll('#log .ok')].filter((el) => el.textContent === 'complete').length + 1,
-    failed: [...document.querySelectorAll('#log .error')].filter((el) => el.textContent.startsWith('process failed')).length,
+    complete: [...document.querySelectorAll('#log .line--ok')].filter((el) => el.textContent.endsWith('complete')).length + 1,
+    failed: [...document.querySelectorAll('#log .line--err')].filter((el) => el.textContent.includes('process failed')).length,
   }));
   await page.click('#run');
 
@@ -161,8 +180,8 @@ async function runProcess(page, method, scale, timeoutMs = 300000) {
     await sleep(2500);
     const state = await page.evaluate((m) => {
       const logEl = document.querySelector('#log');
-      const ok = [...logEl.querySelectorAll('.ok')].filter((el) => el.textContent === 'complete').length;
-      const failed = [...logEl.querySelectorAll('.error')].filter((el) => el.textContent.startsWith('process failed')).length;
+      const ok = [...logEl.querySelectorAll('.line--ok')].filter((el) => el.textContent.endsWith('complete')).length;
+      const failed = [...logEl.querySelectorAll('.line--err')].filter((el) => el.textContent.includes('process failed')).length;
       return { ok, failed: failed > m.failed, tail: logEl.textContent.slice(-200) };
     }, marker);
     if (state.failed) {
@@ -179,7 +198,7 @@ async function runProcess(page, method, scale, timeoutMs = 300000) {
   return page.evaluate((base) => {
     const logEl = document.querySelector('#log');
     const log = logEl.textContent;
-    const failed = [...logEl.querySelectorAll('.error')].filter((el) => el.textContent.startsWith('process failed')).length;
+    const failed = [...logEl.querySelectorAll('.line--err')].filter((el) => el.textContent.includes('process failed')).length;
     if (failed > base) return { ok: false, logTail: log.slice(-300) };
     const img = document.querySelector('#output');
     const c = document.createElement('canvas');
@@ -325,12 +344,12 @@ try {
   await page3.click('#detect');
   await page3.waitForSelector('#caps:not([hidden])', { timeout: 15000 });
   const capsShown = await page3.evaluate(() => document.querySelector('#caps').textContent);
-  check('(c) no-WebGPU env shows honest webgpu=false badge', capsShown.includes('webgpufalse'), capsShown);
+  check('(c) no-WebGPU env shows honest webgpu=false badge', /webgpu:\s*false/.test(capsShown), capsShown);
 
   // (j) Two-Gate regression first: neural before loadModel must throw.
   await injectTestImage(page3);
-  await page3.selectOption('#method', 'neural');
-  await page3.selectOption('#scale', '4');
+  await page3.click('#method-neural');
+  await page3.click('#scaleSeg button[data-scale="4"]');
   await page3.click('#run');
   await page3.waitForFunction(() => document.querySelector('#log').textContent.includes('process failed'), null, { timeout: 15000 });
   check('(j) Two-Gate: neural before loadModel() throws typed error', await page3.evaluate(() => document.querySelector('#log').textContent.includes('requires a prior loadModel')));

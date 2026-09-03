@@ -8,6 +8,15 @@
  *    selects by content and never auto-discovers model URLs.
  *  - PRECISION is an ENGINE capability decision, made from real probed
  *    hardware via the consumer-supplied catalog (`models.webgpu` / `models.wasm`).
+ *
+ * v0.3.0 single-EP session guarantee: a session is created with EXACTLY ONE
+ * execution provider — the capability-chosen one. Never
+ * `['webgpu', 'wasm']`: ONNX Runtime may silently substitute the fallback EP
+ * behind a successful WebGPU promise, which is how a "webgpu" session can
+ * run at WASM speed undetected (the v0.2.0 incident: ~75 s/tile). With one
+ * EP requested, init failure throws into OUR explicit fallback path
+ * (dispose → wasm variant if cataloged → recreate → retry → `fallback`
+ * event), and `requestedEp`/`actualEp` are recorded truth, never guessed.
  */
 
 import * as ort from 'onnxruntime-web/webgpu';
@@ -24,11 +33,14 @@ export type Quantization = 'fp32' | 'fp16' | 'int8';
  *  - variant: which execution-provider family the loaded session targets.
  *  - url: the exact model URL that was selected from the catalog.
  *  - cached: true when served from the Cache API (no network was used).
+ *  - reason (v0.3.0, optional): why this variant was chosen, when the
+ *    choice is non-obvious (software-GPU routing, dual-GPU note).
  */
 export interface LoadModelResult {
   variant: 'webgpu' | 'wasm';
   url: string;
   cached: boolean;
+  reason?: string;
 }
 
 /** Progress/fallback notifications relayed out of the worker by `worker.ts`. */
@@ -52,6 +64,11 @@ export const DEFAULT_ORT_WASM_PATHS = 'https://cdn.jsdelivr.net/npm/onnxruntime-
 const CACHE_NAME = 'upscaler-models';
 /** Upper bound for a worker thread pool inside ORT, matching the tile cap. */
 const MAX_WASM_THREADS = 8;
+
+/** Test seam: the ORT session factory (defaults to the real onnxruntime-web). */
+export type SessionFactory = (bytes: ArrayBuffer, executionProviders: readonly string[]) => Promise<ort.InferenceSession>;
+/** Test seam: cache-first byte acquisition (defaults to the real Cache API path). */
+export type ByteAcquirer = (modelUrl: string) => Promise<ArrayBuffer>;
 
 // ——— IEEE-754 binary16 conversion (round-half-to-even) ————————————————
 // float16 exports carry Uint16Array BIT data; ORT does not convert Float32
@@ -129,9 +146,15 @@ function f16BitsToF32(bits: number): number {
  */
 export class ModelManager {
   readonly #notifications: ModelManagerNotifications;
+  readonly #sessionFactory: SessionFactory | undefined;
+  readonly #byteAcquirer: ByteAcquirer | undefined;
 
   #session: ort.InferenceSession | null = null;
   #activeEP: 'webgpu' | 'wasm' | null = null;
+  /** EP the capability decision ASKED for (single-EP guarantee ⇒ = actual on success). */
+  #requestedEP: 'webgpu' | 'wasm' | null = null;
+  /** EP the successful session was created with — recorded truth, never guessed. */
+  #actualEP: 'webgpu' | 'wasm' | null = null;
   #activeUrl: string | null = null;
   /** WebGPU-precision file kept hot so the fallback can swap variants. */
   #webgpuBytes: ArrayBuffer | null = null;
@@ -141,8 +164,10 @@ export class ModelManager {
   #ortWasmPaths: string | undefined = undefined;
   #lastCached = false;
 
-  constructor(notifications: ModelManagerNotifications) {
+  constructor(notifications: ModelManagerNotifications, sessionFactory?: SessionFactory, byteAcquirer?: ByteAcquirer) {
     this.#notifications = notifications;
+    this.#sessionFactory = sessionFactory;
+    this.#byteAcquirer = byteAcquirer;
   }
 
   /** Input tensor name, read from the live session — never hardcoded. */
@@ -163,11 +188,22 @@ export class ModelManager {
     return this.#activeEP;
   }
 
+  /** EP the capability decision asked for (null before any load attempt). */
+  get requestedEp(): 'webgpu' | 'wasm' | null {
+    return this.#requestedEP;
+  }
+
+  /** EP the successful session was actually created with. */
+  get actualEp(): 'webgpu' | 'wasm' | null {
+    return this.#actualEP;
+  }
+
   /**
    * Loads (cache-first) the model and creates an ORT session.
    *
    * Catalog path: `capabilities.webgpu && models.webgpu` selects the WebGPU
-   * variant; otherwise `models.wasm`. A missing variant throws
+   * variant — EXCEPT on a software GPU adapter, which routes to
+   * `models.wasm` when present (reason recorded). A missing variant throws
    * `MODEL_VARIANT_MISSING` naming exactly what is absent.
    * Simple path (`models` omitted): `modelUrl` for every EP — today's
    * behavior, unchanged.
@@ -177,21 +213,28 @@ export class ModelManager {
     models?: { webgpu?: string; wasm?: string };
     capabilities: Capabilities;
     ortWasmPaths?: string;
-  }): Promise<LoadModelResult> {
+    forceReload?: boolean;
+  }): Promise<LoadModelResult & { requestedEp: 'webgpu' | 'wasm'; actualEp: 'webgpu' | 'wasm' }> {
     const { modelUrl, models, capabilities } = options;
 
     // ——— Selection (capability decision from a consumer-supplied catalog) ——
     let selectedUrl: string;
+    let reason: string | undefined;
+    /** EP implied by the selection — a software-GPU-routed wasm variant runs on the WASM EP, not the software WebGPU adapter. */
+    let selectionEp: 'webgpu' | 'wasm' | null = null;
     if (models) {
       // Throws MODEL_VARIANT_MISSING (typed, names what's missing) when the
       // catalog cannot serve the probed hardware.
       const selection = selectModelVariant(models, capabilities);
       selectedUrl = selection.url;
+      reason = selection.reason;
+      selectionEp = selection.variant;
       this.#wasmFallbackUrl = selection.wasmFallbackUrl;
     } else if (modelUrl) {
       // Simple path: one file for every EP. Fallback reuses the same file —
       // the consumer's informed choice (may legitimately fail for fp16).
       selectedUrl = modelUrl;
+      reason = undefined;
       this.#wasmFallbackUrl = undefined;
     } else {
       throw new UpscalerError(
@@ -202,23 +245,64 @@ export class ModelManager {
     }
 
     const key = selectedUrl;
-    if (this.#session && this.#loadedKey === key) {
-      return { variant: this.#activeEP!, url: this.#activeUrl!, cached: this.#lastCached };
+    if (!options.forceReload && this.#session && this.#loadedKey === key) {
+      return {
+        variant: this.#activeEP!,
+        url: this.#activeUrl!,
+        cached: this.#lastCached,
+        ...(reason !== undefined ? { reason } : {}),
+        requestedEp: this.#requestedEP!,
+        actualEp: this.#actualEP!,
+      };
     }
 
     this.#configureOrtEnv(capabilities, options.ortWasmPaths);
 
-    const primaryBytes = await this.#acquireModelBytes(selectedUrl);
+    const primaryBytes = await this.#getBytes(selectedUrl);
 
     // Drop any previous session BEFORE creating the new one so the old
     // graph's memory is released while we still hold the new bytes.
     this.#disposeSession();
-    await this.#createSession(primaryBytes, selectedUrl, capabilities);
-    this.#loadedKey = key;
-    this.#activeUrl = selectedUrl;
 
-    // Track which file a mid-flight WebGPU→WASM fallback should use.
-    if (this.#activeEP === 'webgpu') {
+    // ——— Single-EP session creation with OUR explicit fallback path ——————
+    // The capability-chosen EP is requested alone; if IT fails to create a
+    // session, we dispose, (optionally swap to the catalog's wasm variant),
+    // recreate on the WASM EP and emit the existing `fallback` event. ORT is
+    // never handed a two-EP list it could silently substitute.
+    // Catalog path: the EP follows the SELECTION (a software-GPU-routed wasm
+    // variant runs on the WASM EP — the software WebGPU adapter is exactly
+    // what routing avoids). Simple path: probed hardware decides.
+    const requestedEp: 'webgpu' | 'wasm' = selectionEp ?? (capabilities.webgpu ? 'webgpu' : 'wasm');
+    this.#requestedEP = requestedEp;
+    try {
+      await this.#createSession(primaryBytes, selectedUrl, requestedEp);
+    } catch (err) {
+      if (requestedEp !== 'webgpu') {
+        throw err; // WASM was the choice; there is nothing to fall back to.
+      }
+      const reasonText = err instanceof Error ? err.message : String(err);
+      // Fallback target FIRST, then emit the event so it always reports what
+      // the retrying session actually uses. Always acquire through the
+      // cache-first path — #wasmBytes may hold a PREVIOUS model's bytes.
+      let retryBytes: ArrayBuffer;
+      let swappedTo: 'wasm-variant' | 'same-file';
+      if (this.#wasmFallbackUrl) {
+        retryBytes = await this.#getBytes(this.#wasmFallbackUrl);
+        this.#wasmBytes = retryBytes;
+        this.#activeUrl = this.#wasmFallbackUrl;
+        swappedTo = 'wasm-variant';
+      } else {
+        retryBytes = primaryBytes;
+        swappedTo = 'same-file';
+      }
+      this.#notifications.onFallback(`WebGPU session creation failed: ${reasonText}`, swappedTo);
+      await this.#createSession(retryBytes, this.#activeUrl ?? selectedUrl, 'wasm');
+    }
+    this.#loadedKey = key;
+
+    // Track which file a mid-flight WebGPU→WASM fallback should use. Always
+    // keyed to THIS load — never retain a previous model's bytes.
+    if (this.#actualEP === 'webgpu') {
       this.#webgpuBytes = primaryBytes;
       this.#wasmBytes = null; // wasm-variant bytes are fetched lazily via the cache-first path
     } else {
@@ -227,9 +311,12 @@ export class ModelManager {
     }
 
     return {
-      variant: this.#activeEP!,
+      variant: this.#actualEP!,
       url: this.#activeUrl!,
       cached: this.#lastCached,
+      ...(reason !== undefined ? { reason } : {}),
+      requestedEp: this.#requestedEP!,
+      actualEp: this.#actualEP!,
     };
   }
 
@@ -266,7 +353,7 @@ export class ModelManager {
       let swappedTo: 'wasm-variant' | 'same-file' = 'same-file';
       if (this.#wasmFallbackUrl) {
         if (this.#wasmBytes === null) {
-          retryBytes = await this.#acquireModelBytes(this.#wasmFallbackUrl);
+          retryBytes = await this.#getBytes(this.#wasmFallbackUrl);
           this.#wasmBytes = retryBytes;
         } else {
           retryBytes = this.#wasmBytes;
@@ -288,8 +375,9 @@ export class ModelManager {
       }
 
       this.#notifications.onFallback(reason, swappedTo);
+      this.#requestedEP = 'wasm';
 
-      await this.#createSession(retryBytes, this.#activeUrl ?? '', { webgpu: false });
+      await this.#createSession(retryBytes, this.#activeUrl ?? '', 'wasm');
       try {
         const output = await this.#runWithSession(this.#session!, this.#marshalInput(image));
         return this.#unmarshalOutput(image, output);
@@ -316,6 +404,11 @@ export class ModelManager {
 
   /** Distinct wasm-precision variant URL for a mid-flight swap, if any. */
   #wasmFallbackUrl: string | undefined = undefined;
+
+  /** Byte acquisition: the injected test seam or the real cache-first path. */
+  #getBytes(modelUrl: string): Promise<ArrayBuffer> {
+    return this.#byteAcquirer ? this.#byteAcquirer(modelUrl) : this.#acquireModelBytes(modelUrl);
+  }
 
   async #runWithSession(session: ort.InferenceSession, input: ort.Tensor): Promise<ort.Tensor> {
     try {
@@ -450,35 +543,20 @@ export class ModelManager {
   }
 
   /**
-   * Creates the ORT session. Prefers the WebGPU EP (WASM partition fallback
-   * inside the graph); falls back to a WASM-only session if WebGPU cannot
-   * create one, emitting the fallback event (same-file semantics — session
-   * creation never swaps variants; mid-flight inference failure does).
+   * Creates the ORT session with EXACTLY ONE execution provider (see class
+   * doc — the single-EP guarantee). The caller owns the fallback policy:
+   * here a failure simply throws, so init failures surface into OUR
+   * explicit fallback path in loadModel()/run() instead of ORT silently
+   * substituting an EP behind a two-element list.
    */
-  async #createSession(
-    modelBytes: ArrayBuffer,
-    url: string,
-    capabilities: Pick<Capabilities, 'webgpu'>,
-  ): Promise<void> {
-    if (capabilities.webgpu) {
-      try {
-        this.#session = await ort.InferenceSession.create(modelBytes.slice(0), {
-          executionProviders: ['webgpu', 'wasm'],
-          graphOptimizationLevel: 'all',
-        });
-        this.#activeEP = 'webgpu';
-        this.#activeUrl = url;
-        return;
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        this.#notifications.onFallback(`WebGPU session creation failed: ${reason}`, 'same-file');
-      }
-    }
-    this.#session = await ort.InferenceSession.create(modelBytes.slice(0), {
-      executionProviders: ['wasm'],
+  async #createSession(modelBytes: ArrayBuffer, url: string, ep: 'webgpu' | 'wasm'): Promise<void> {
+    const create = this.#sessionFactory ?? ((bytes, providers) => ort.InferenceSession.create(bytes.slice(0), {
+      executionProviders: providers as ('webgpu' | 'wasm')[],
       graphOptimizationLevel: 'all',
-    });
-    this.#activeEP = 'wasm';
+    }));
+    this.#session = await create(modelBytes, [ep]);
+    this.#activeEP = ep;
+    this.#actualEP = ep;
     this.#activeUrl = url;
   }
 
@@ -486,6 +564,7 @@ export class ModelManager {
     this.#session?.release().catch(() => undefined);
     this.#session = null;
     this.#activeEP = null;
+    this.#actualEP = null;
   }
 
   /**

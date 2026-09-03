@@ -1,6 +1,6 @@
 {
   "name": "@arcfoundry/upscaler",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Headless, local-first image upscaling engine for the browser. WebGPU neural + Rust/WASM classical. Zero uploads. Zero servers.",
   "type": "module",
   "license": "MIT",

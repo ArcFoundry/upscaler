@@ -10,12 +10,21 @@
  * capability probe, timeouts, and the object-URL lifecycle contract.
  */
 
-import { DeviceRouter, type Capabilities } from './DeviceRouter.js';
+import {
+  DeviceRouter,
+  type AdapterInfoSummary,
+  type Capabilities,
+  type GpuPreference,
+  type GpuTier,
+  TIER_NEURAL_MEGAPIXELS,
+} from './DeviceRouter.js';
 import { EventEmitter, type UpscalerEvent, type UpscalerEventListener, type UpscalerEventType } from './EventEmitter.js';
 import { UpscalerError, type UpscalerErrorCode } from './errors.js';
 import type { LoadModelResult, Quantization } from './ModelManager.js';
 import type { ModelCatalog } from './ModelSelection.js';
-import { UpscalerEngine } from './UpscalerEngine.js';
+import { ModelManager, type SessionFactory } from './ModelManager.js';
+import { TimeoutGovernor, type TimeoutExpireReason } from './Timeouts.js';
+import { UpscalerEngine, type EngineDiagnostics } from './UpscalerEngine.js';
 import type { Method } from './WorkerController.js';
 
 // ——— Public surface ————————————————————————————————————————————————
@@ -23,9 +32,29 @@ export { UpscalerEngine };
 export { DeviceRouter };
 export { EventEmitter };
 export { UpscalerError };
+/** Timeout policy for one in-flight operation (idle + optional hard cap). */
+export { TimeoutGovernor };
+/**
+ * Model lifecycle manager (cache-first fetch, single-EP session creation,
+ * fallback). Advanced consumers may drive it directly; the engine owns one
+ * inside its worker.
+ */
+export { ModelManager };
+/** Advisory neural input ceiling (megapixels) per gpu tier. HEURISTIC. */
+export { TIER_NEURAL_MEGAPIXELS };
+export { classifyGpuTier, isSoftwareGpuInfo, readAdapterInfo, adapterInfoKey } from './DeviceRouter.js';
+/** Tier-driven neural compute policy (tile size / overlap / concurrency). */
+export { tilePolicyFor, TILE_OVERLAP, HIGH_TIER_OVERLAP } from './TileProcessor.js';
+export type { TilePolicy, TileProgressInfo } from './TileProcessor.js';
 
 export type {
+  AdapterInfoSummary,
+  SessionFactory,
+  TimeoutExpireReason,
   Capabilities,
+  EngineDiagnostics,
+  GpuPreference,
+  GpuTier,
   UpscalerEvent,
   UpscalerEventType,
   UpscalerEventListener,

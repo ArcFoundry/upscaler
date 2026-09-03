@@ -334,59 +334,25 @@ var Codec = class {
   }
 };
 
-// src/DeviceRouter.ts
-function isSecure() {
-  return typeof isSecureContext !== "undefined" && isSecureContext;
-}
-function isCrossOriginIsolated() {
-  return typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
-}
-var DeviceRouter = class {
-  #capabilities = null;
-  #probing = null;
-  /**
-   * Probes (once, then memoizes) the device capabilities. Concurrent calls
-   * share a single probe.
-   */
-  getCapabilities() {
-    this.#probing ??= this.#probe().then((caps) => {
-      this.#capabilities = caps;
-      return caps;
-    });
-    return this.#probing;
-  }
-  /** Previously memoized capabilities, if a probe already completed. */
-  get cached() {
-    return this.#capabilities;
-  }
-  async #probe() {
-    const nav = navigator;
-    let webgpu = false;
-    if (isSecure() && typeof nav.gpu?.requestAdapter === "function") {
-      try {
-        const adapter = await nav.gpu.requestAdapter();
-        webgpu = adapter != null;
-      } catch {
-        webgpu = false;
-      }
-    }
-    const deviceMemory = nav.deviceMemory;
-    const lowVram = typeof deviceMemory !== "number" || deviceMemory <= 4;
-    const wasm2 = typeof WebAssembly === "object";
-    const wasmThreads = wasm2 && isCrossOriginIsolated() && typeof SharedArrayBuffer === "function";
-    return { webgpu, wasm: wasm2, wasmThreads, lowVram };
-  }
-};
-
 // src/ModelManager.ts
 import * as ort from "onnxruntime-web/webgpu";
 
 // src/ModelSelection.ts
-function selectModelVariant(catalog, capabilities2) {
-  if (capabilities2.webgpu && catalog.webgpu) {
+function selectModelVariant(catalog, capabilities) {
+  if (capabilities.webgpu && catalog.webgpu) {
+    if (capabilities.softwareGpu && catalog.wasm) {
+      return {
+        variant: "wasm",
+        url: catalog.wasm,
+        reason: "software GPU adapter detected (SwiftShader-like rasterizer) \u2014 routed to the wasm variant; the software WebGPU EP would run the same math on the same CPU, slower"
+      };
+    }
     return {
       variant: "webgpu",
       url: catalog.webgpu,
+      ...capabilities.softwareGpu ? {
+        reason: "software GPU adapter detected but the catalog has no wasm variant \u2014 proceeding on the software WebGPU EP (expect slow inference)"
+      } : capabilities.dualGpu ? { reason: "dual-GPU device \u2014 the high-performance adapter was requested for this compute workload" } : {},
       ...catalog.wasm && catalog.wasm !== catalog.webgpu ? { wasmFallbackUrl: catalog.wasm } : {}
     };
   }
@@ -395,7 +361,7 @@ function selectModelVariant(catalog, capabilities2) {
   }
   throw new UpscalerError(
     "MODEL_VARIANT_MISSING",
-    capabilities2.webgpu ? 'The models catalog has no "wasm" variant. The WebGPU variant only runs on the WebGPU execution provider; supply models.wasm (a fp32/int8 export) for CPU/WASM execution.' : 'No WebGPU adapter was probed and the models catalog has no "wasm" variant. Supply models.wasm (a fp32/int8 export) for CPU/WASM execution.',
+    capabilities.webgpu ? 'The models catalog has no "wasm" variant. The WebGPU variant only runs on the WebGPU execution provider; supply models.wasm (a fp32/int8 export) for CPU/WASM execution.' : 'No WebGPU adapter was probed and the models catalog has no "wasm" variant. Supply models.wasm (a fp32/int8 export) for CPU/WASM execution.',
     { recoverable: true }
   );
 }
@@ -459,8 +425,14 @@ function f16BitsToF32(bits) {
 }
 var ModelManager = class {
   #notifications;
+  #sessionFactory;
+  #byteAcquirer;
   #session = null;
   #activeEP = null;
+  /** EP the capability decision ASKED for (single-EP guarantee ⇒ = actual on success). */
+  #requestedEP = null;
+  /** EP the successful session was created with — recorded truth, never guessed. */
+  #actualEP = null;
   #activeUrl = null;
   /** WebGPU-precision file kept hot so the fallback can swap variants. */
   #webgpuBytes = null;
@@ -469,8 +441,10 @@ var ModelManager = class {
   #envConfigured = false;
   #ortWasmPaths = void 0;
   #lastCached = false;
-  constructor(notifications) {
+  constructor(notifications, sessionFactory, byteAcquirer) {
     this.#notifications = notifications;
+    this.#sessionFactory = sessionFactory;
+    this.#byteAcquirer = byteAcquirer;
   }
   /** Input tensor name, read from the live session — never hardcoded. */
   get inputName() {
@@ -486,24 +460,38 @@ var ModelManager = class {
   get activeVariant() {
     return this.#activeEP;
   }
+  /** EP the capability decision asked for (null before any load attempt). */
+  get requestedEp() {
+    return this.#requestedEP;
+  }
+  /** EP the successful session was actually created with. */
+  get actualEp() {
+    return this.#actualEP;
+  }
   /**
    * Loads (cache-first) the model and creates an ORT session.
    *
    * Catalog path: `capabilities.webgpu && models.webgpu` selects the WebGPU
-   * variant; otherwise `models.wasm`. A missing variant throws
+   * variant — EXCEPT on a software GPU adapter, which routes to
+   * `models.wasm` when present (reason recorded). A missing variant throws
    * `MODEL_VARIANT_MISSING` naming exactly what is absent.
    * Simple path (`models` omitted): `modelUrl` for every EP — today's
    * behavior, unchanged.
    */
   async loadModel(options) {
-    const { modelUrl, models, capabilities: capabilities2 } = options;
+    const { modelUrl, models, capabilities } = options;
     let selectedUrl;
+    let reason;
+    let selectionEp = null;
     if (models) {
-      const selection = selectModelVariant(models, capabilities2);
+      const selection = selectModelVariant(models, capabilities);
       selectedUrl = selection.url;
+      reason = selection.reason;
+      selectionEp = selection.variant;
       this.#wasmFallbackUrl = selection.wasmFallbackUrl;
     } else if (modelUrl) {
       selectedUrl = modelUrl;
+      reason = void 0;
       this.#wasmFallbackUrl = void 0;
     } else {
       throw new UpscalerError(
@@ -513,16 +501,44 @@ var ModelManager = class {
       );
     }
     const key = selectedUrl;
-    if (this.#session && this.#loadedKey === key) {
-      return { variant: this.#activeEP, url: this.#activeUrl, cached: this.#lastCached };
+    if (!options.forceReload && this.#session && this.#loadedKey === key) {
+      return {
+        variant: this.#activeEP,
+        url: this.#activeUrl,
+        cached: this.#lastCached,
+        ...reason !== void 0 ? { reason } : {},
+        requestedEp: this.#requestedEP,
+        actualEp: this.#actualEP
+      };
     }
-    this.#configureOrtEnv(capabilities2, options.ortWasmPaths);
-    const primaryBytes = await this.#acquireModelBytes(selectedUrl);
+    this.#configureOrtEnv(capabilities, options.ortWasmPaths);
+    const primaryBytes = await this.#getBytes(selectedUrl);
     this.#disposeSession();
-    await this.#createSession(primaryBytes, selectedUrl, capabilities2);
+    const requestedEp = selectionEp ?? (capabilities.webgpu ? "webgpu" : "wasm");
+    this.#requestedEP = requestedEp;
+    try {
+      await this.#createSession(primaryBytes, selectedUrl, requestedEp);
+    } catch (err) {
+      if (requestedEp !== "webgpu") {
+        throw err;
+      }
+      const reasonText = err instanceof Error ? err.message : String(err);
+      let retryBytes;
+      let swappedTo;
+      if (this.#wasmFallbackUrl) {
+        retryBytes = await this.#getBytes(this.#wasmFallbackUrl);
+        this.#wasmBytes = retryBytes;
+        this.#activeUrl = this.#wasmFallbackUrl;
+        swappedTo = "wasm-variant";
+      } else {
+        retryBytes = primaryBytes;
+        swappedTo = "same-file";
+      }
+      this.#notifications.onFallback(`WebGPU session creation failed: ${reasonText}`, swappedTo);
+      await this.#createSession(retryBytes, this.#activeUrl ?? selectedUrl, "wasm");
+    }
     this.#loadedKey = key;
-    this.#activeUrl = selectedUrl;
-    if (this.#activeEP === "webgpu") {
+    if (this.#actualEP === "webgpu") {
       this.#webgpuBytes = primaryBytes;
       this.#wasmBytes = null;
     } else {
@@ -530,9 +546,12 @@ var ModelManager = class {
       this.#wasmBytes = primaryBytes;
     }
     return {
-      variant: this.#activeEP,
+      variant: this.#actualEP,
       url: this.#activeUrl,
-      cached: this.#lastCached
+      cached: this.#lastCached,
+      ...reason !== void 0 ? { reason } : {},
+      requestedEp: this.#requestedEP,
+      actualEp: this.#actualEP
     };
   }
   /**
@@ -563,7 +582,7 @@ var ModelManager = class {
       let swappedTo = "same-file";
       if (this.#wasmFallbackUrl) {
         if (this.#wasmBytes === null) {
-          retryBytes = await this.#acquireModelBytes(this.#wasmFallbackUrl);
+          retryBytes = await this.#getBytes(this.#wasmFallbackUrl);
           this.#wasmBytes = retryBytes;
         } else {
           retryBytes = this.#wasmBytes;
@@ -583,7 +602,8 @@ var ModelManager = class {
         );
       }
       this.#notifications.onFallback(reason, swappedTo);
-      await this.#createSession(retryBytes, this.#activeUrl ?? "", { webgpu: false });
+      this.#requestedEP = "wasm";
+      await this.#createSession(retryBytes, this.#activeUrl ?? "", "wasm");
       try {
         const output = await this.#runWithSession(this.#session, this.#marshalInput(image));
         return this.#unmarshalOutput(image, output);
@@ -607,6 +627,10 @@ var ModelManager = class {
   // ——— Internals ————————————————————————————————————————————————————
   /** Distinct wasm-precision variant URL for a mid-flight swap, if any. */
   #wasmFallbackUrl = void 0;
+  /** Byte acquisition: the injected test seam or the real cache-first path. */
+  #getBytes(modelUrl) {
+    return this.#byteAcquirer ? this.#byteAcquirer(modelUrl) : this.#acquireModelBytes(modelUrl);
+  }
   async #runWithSession(session, input) {
     try {
       const feeds = { [session.inputNames[0] ?? "x"]: input };
@@ -642,16 +666,16 @@ var ModelManager = class {
    *    inference fails at runtime. (Not part of the public typings in all
    *    ORT releases, hence the widening cast — the runtime honors it.)
    */
-  #configureOrtEnv(capabilities2, ortWasmPaths) {
+  #configureOrtEnv(capabilities, ortWasmPaths) {
     if (this.#envConfigured) {
       return;
     }
     this.#ortWasmPaths = ortWasmPaths;
     ort.env.wasm.wasmPaths = this.#ortWasmPaths ?? DEFAULT_ORT_WASM_PATHS;
     const hw = typeof navigator !== "undefined" ? navigator.hardwareConcurrency || 4 : 4;
-    ort.env.wasm.numThreads = capabilities2.wasmThreads ? Math.min(hw, MAX_WASM_THREADS) : 1;
+    ort.env.wasm.numThreads = capabilities.wasmThreads ? Math.min(hw, MAX_WASM_THREADS) : 1;
     ort.env.wasm.proxy = false;
-    ort.env.wasm.jsep = capabilities2.webgpu;
+    ort.env.wasm.jsep = capabilities.webgpu;
     this.#envConfigured = true;
   }
   /**
@@ -729,37 +753,27 @@ var ModelManager = class {
     return bytes;
   }
   /**
-   * Creates the ORT session. Prefers the WebGPU EP (WASM partition fallback
-   * inside the graph); falls back to a WASM-only session if WebGPU cannot
-   * create one, emitting the fallback event (same-file semantics — session
-   * creation never swaps variants; mid-flight inference failure does).
+   * Creates the ORT session with EXACTLY ONE execution provider (see class
+   * doc — the single-EP guarantee). The caller owns the fallback policy:
+   * here a failure simply throws, so init failures surface into OUR
+   * explicit fallback path in loadModel()/run() instead of ORT silently
+   * substituting an EP behind a two-element list.
    */
-  async #createSession(modelBytes, url, capabilities2) {
-    if (capabilities2.webgpu) {
-      try {
-        this.#session = await ort.InferenceSession.create(modelBytes.slice(0), {
-          executionProviders: ["webgpu", "wasm"],
-          graphOptimizationLevel: "all"
-        });
-        this.#activeEP = "webgpu";
-        this.#activeUrl = url;
-        return;
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        this.#notifications.onFallback(`WebGPU session creation failed: ${reason}`, "same-file");
-      }
-    }
-    this.#session = await ort.InferenceSession.create(modelBytes.slice(0), {
-      executionProviders: ["wasm"],
+  async #createSession(modelBytes, url, ep) {
+    const create = this.#sessionFactory ?? ((bytes, providers) => ort.InferenceSession.create(bytes.slice(0), {
+      executionProviders: providers,
       graphOptimizationLevel: "all"
-    });
-    this.#activeEP = "wasm";
+    }));
+    this.#session = await create(modelBytes, [ep]);
+    this.#activeEP = ep;
+    this.#actualEP = ep;
     this.#activeUrl = url;
   }
   #disposeSession() {
     this.#session?.release().catch(() => void 0);
     this.#session = null;
     this.#activeEP = null;
+    this.#actualEP = null;
   }
   /**
    * RGBA → CHW RGB tensor with [0,1] normalization, shaped [1,3,H,W].
@@ -824,22 +838,50 @@ var ModelManager = class {
 
 // src/TileProcessor.ts
 var TILE_OVERLAP = 16;
+var HIGH_TIER_OVERLAP = 24;
 var TILE_SIZE = 512;
 var TILE_SIZE_LOW_VRAM = 256;
-var MAX_CONCURRENT_TILES_WEBGPU = 4;
-var MAX_CONCURRENT_TILES_WASM = 8;
+function tilePolicyFor(capabilities, hardwareConcurrency = 4) {
+  const tier = capabilities.gpuTier ?? "entry";
+  let policy;
+  switch (tier) {
+    case "high":
+      policy = { tileSize: TILE_SIZE, overlap: HIGH_TIER_OVERLAP, concurrency: 4 };
+      break;
+    case "mid":
+      policy = { tileSize: TILE_SIZE, overlap: TILE_OVERLAP, concurrency: 4 };
+      break;
+    default:
+      policy = { tileSize: TILE_SIZE_LOW_VRAM, overlap: TILE_OVERLAP, concurrency: 2 };
+      break;
+  }
+  if (capabilities.lowVram) {
+    policy = {
+      tileSize: Math.min(policy.tileSize, TILE_SIZE_LOW_VRAM),
+      overlap: Math.min(policy.overlap, TILE_OVERLAP),
+      concurrency: Math.min(policy.concurrency, 2)
+    };
+  }
+  if (!capabilities.webgpu) {
+    policy = { ...policy, concurrency: Math.min(policy.concurrency, Math.max(1, hardwareConcurrency)) };
+  }
+  return policy;
+}
 var TileProcessor = class {
-  #onTileStart;
-  constructor(onTileStart) {
-    this.#onTileStart = onTileStart;
+  #onTile;
+  constructor(onTile) {
+    this.#onTile = onTile;
   }
   /**
    * Processes `image` with the tiled Real-ESRGAN pipeline at the model's
-   * fixed 4x. Returns the full upscaled image.
+   * fixed 4x. Returns the full upscaled image. One `tile_processing`
+   * notification fires PER COMPLETED TILE with its duration and the running
+   * ETA (average over completed tiles × remaining ÷ concurrency).
    */
-  async processNeural(image, capabilities2, model) {
-    const tileSize = capabilities2.lowVram ? TILE_SIZE_LOW_VRAM : TILE_SIZE;
-    const core = tileSize - 2 * TILE_OVERLAP;
+  async processNeural(image, capabilities, model) {
+    const hw = typeof navigator !== "undefined" ? navigator.hardwareConcurrency || 4 : 4;
+    const { tileSize, overlap, concurrency } = tilePolicyFor(capabilities, hw);
+    const core = tileSize - 2 * overlap;
     const scale = 4;
     const { width: W, height: H } = image;
     const cols = Math.ceil(W / core);
@@ -856,8 +898,18 @@ var TileProcessor = class {
       }
     }
     let next = 0;
-    const hw = typeof navigator !== "undefined" ? navigator.hardwareConcurrency || 4 : 4;
-    const concurrency = capabilities2.webgpu ? MAX_CONCURRENT_TILES_WEBGPU : Math.min(hw, MAX_CONCURRENT_TILES_WASM);
+    const durations = [];
+    const emitComplete = (index, durationMs) => {
+      durations.push(durationMs);
+      const avg = durations.reduce((a, b) => a + b, 0) / durations.length;
+      const remaining = total - durations.length;
+      this.#onTile({
+        tileIndex: index,
+        totalTiles: total,
+        tileDurationMs: Math.round(durationMs),
+        etaMs: remaining > 0 ? Math.round(avg * remaining / concurrency) : 0
+      });
+    };
     const worker = async () => {
       for (; ; ) {
         const i = next++;
@@ -865,10 +917,11 @@ var TileProcessor = class {
           return;
         }
         const job = jobs[i];
-        this.#onTileStart(job.index, total);
-        const tile = this.#extractTile(image, job.x0, job.y0, tileSize);
+        const t0 = performance.now();
+        const tile = this.#extractTile(image, job.x0, job.y0, tileSize, overlap);
         const upscaled = await this.#inferTile(tile, model);
-        this.#composite(out, written, upscaled, job.x0, job.y0, W, H, core, scale);
+        this.#composite(out, written, upscaled, job.x0, job.y0, W, H, core, scale, overlap);
+        emitComplete(job.index, performance.now() - t0);
       }
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
@@ -876,13 +929,13 @@ var TileProcessor = class {
   }
   /**
    * Extracts a `tileSize × tileSize` source rect centered on the core at
-   * (`x0`, `y0`), with `TILE_OVERLAP` context on interior sides, clamped to
-   * the image. Interior edges keep full context; image-border edges are
-   * clamped away (no fabricated pixels).
+   * (`x0`, `y0`), with `overlap` context on interior sides, clamped to the
+   * image. Interior edges keep full context; image-border edges are clamped
+   * away (no fabricated pixels).
    */
-  #extractTile(image, x0, y0, tileSize) {
-    const rectX = Math.max(0, x0 - TILE_OVERLAP);
-    const rectY = Math.max(0, y0 - TILE_OVERLAP);
+  #extractTile(image, x0, y0, tileSize, overlap) {
+    const rectX = Math.max(0, x0 - overlap);
+    const rectY = Math.max(0, y0 - overlap);
     const rectW = Math.min(tileSize, image.width - rectX);
     const rectH = Math.min(tileSize, image.height - rectY);
     const tile = new ImageData(rectW, rectH);
@@ -906,18 +959,18 @@ var TileProcessor = class {
    * Blends one upscaled tile into the output (see class doc for the
    * first-write / cross-fade rule and the feather weights).
    */
-  #composite(out, written, tile, x0, y0, srcW, srcH, core, scale) {
+  #composite(out, written, tile, x0, y0, srcW, srcH, core, scale, overlap) {
     const outW = srcW * scale;
     const outH = srcH * scale;
-    const rectX = Math.max(0, x0 - TILE_OVERLAP);
-    const rectY = Math.max(0, y0 - TILE_OVERLAP);
+    const rectX = Math.max(0, x0 - overlap);
+    const rectY = Math.max(0, y0 - overlap);
     const rectW = Math.min(tile.width, srcW - rectX);
     const rectH = Math.min(tile.height, srcH - rectY);
     const destX = rectX * scale;
     const destY = rectY * scale;
     const destW = rectW * scale;
     const destH = rectH * scale;
-    const feather = TILE_OVERLAP * scale;
+    const feather = overlap * scale;
     const hasLeft = x0 > 0;
     const hasTop = y0 > 0;
     const hasRight = x0 + core < srcW;
@@ -975,21 +1028,23 @@ function initWasm() {
   wasmReady ??= __wbg_init().then(() => void 0);
   return wasmReady;
 }
-var capabilities = null;
-async function getCapabilities() {
-  capabilities ??= await new DeviceRouter().getCapabilities();
-  return capabilities;
-}
 var state = null;
 var currentId = 0;
 function getState() {
   if (!state) {
     const model = new ModelManager({
       onDownloadProgress: (progress) => emit({ kind: "model_download", id: currentId, progress }),
-      onFallback: (reason) => emit({ kind: "fallback", id: currentId, reason })
+      onFallback: (reason, swappedTo) => emit({ kind: "fallback", id: currentId, reason, swappedTo })
     });
     const tiles = new TileProcessor(
-      (tileIndex, totalTiles) => emit({ kind: "tile_processing", id: currentId, tileIndex, totalTiles })
+      (info) => emit({
+        kind: "tile_processing",
+        id: currentId,
+        tileIndex: info.tileIndex,
+        totalTiles: info.totalTiles,
+        ...info.tileDurationMs !== void 0 ? { tileDurationMs: info.tileDurationMs } : {},
+        ...info.etaMs !== void 0 ? { etaMs: info.etaMs } : {}
+      })
     );
     state = { model, tiles };
   }
@@ -997,6 +1052,18 @@ function getState() {
 }
 function emit(message) {
   self.postMessage(message);
+}
+var HEARTBEAT_MS = 1e4;
+var heartbeatTimer = null;
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => emit({ kind: "heartbeat", id: currentId }), HEARTBEAT_MS);
+}
+function stopHeartbeat() {
+  if (heartbeatTimer !== null) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
 }
 function toImageData(bytes, width, height) {
   return new ImageData(
@@ -1024,7 +1091,7 @@ async function runClassical(image, method, scale, format, quality) {
     job?.free();
   }
 }
-async function runNeural(image, scale, format, quality) {
+async function runNeural(image, scale, format, capabilities, quality) {
   const { model, tiles } = getState();
   if (!model.isLoaded) {
     throw new UpscalerError(
@@ -1042,7 +1109,7 @@ async function runNeural(image, scale, format, quality) {
       { recoverable: false }
     );
   }
-  const upscaled = await tiles.processNeural(image, await getCapabilities(), model);
+  const upscaled = await tiles.processNeural(image, capabilities, model);
   if (scale === 2) {
     await initWasm();
     let job = null;
@@ -1079,23 +1146,33 @@ async function runProcess(message) {
   }
   switch (message.method) {
     case "lanczos":
-    case "bicubic":
-      emit({ kind: "tile_processing", id: currentId, tileIndex: 0, totalTiles: 1 });
-      return runClassical(image, message.method, message.scale, message.format, message.quality);
-    case "neural":
+    case "bicubic": {
+      const t0 = performance.now();
+      const blob = await runClassical(image, message.method, message.scale, message.format, message.quality);
+      emit({
+        kind: "tile_processing",
+        id: currentId,
+        tileIndex: 0,
+        totalTiles: 1,
+        tileDurationMs: Math.round(performance.now() - t0)
+      });
+      return blob;
+    }
+    case "neural": {
       runningMaxDimension = message.maxDimension;
-      return runNeural(image, message.scale, message.format, message.quality);
+      return runNeural(image, message.scale, message.format, message.capabilities, message.quality);
+    }
   }
 }
 async function handle(message) {
   switch (message.kind) {
     case "load-model": {
-      const caps = await getCapabilities();
       const result = await getState().model.loadModel({
         modelUrl: message.modelUrl,
         models: message.models,
-        capabilities: caps,
-        ortWasmPaths: message.ortWasmPaths
+        capabilities: message.capabilities,
+        ortWasmPaths: message.ortWasmPaths,
+        ...message.forceReload ? { forceReload: true } : {}
       });
       emit({ kind: "ready", id: message.id, ...result });
       return;
@@ -1110,6 +1187,7 @@ async function handle(message) {
 self.onmessage = (event) => {
   const message = event.data;
   currentId = message.id;
-  void handle(message).catch(() => void 0);
+  startHeartbeat();
+  void handle(message).catch(() => void 0).finally(() => stopHeartbeat());
 };
 //# sourceMappingURL=worker.js.map

@@ -84,21 +84,24 @@ engine.destroy(); // terminates the worker, frees WASM + session memory
 | --- | --- | --- | --- |
 | `modelUrl` | `string` | — | URL of a single Real-ESRGAN `.onnx` file used on **every** device. Mutually exclusive with `models` (configuring both throws `INVALID_INPUT`). If it ends with `/`, the variant filename `realesrgan-x4-<quantization>.onnx` is appended automatically. |
 | `models` | `{ webgpu?: string; wasm?: string }` | — | Capability-aware model catalog. `loadModel()` probes the device and loads `models.webgpu` on WebGPU-capable hardware, otherwise `models.wasm`. A catalog missing the variant the probed device needs throws a descriptive `MODEL_VARIANT_MISSING` error. Mutually exclusive with `modelUrl`. See [Model Hosting](#model-hosting). |
-| `timeout` | `number` | `300_000` | Per-operation timeout (ms) for `loadModel()`/`process()`. On expiry the worker is terminated and a non-recoverable `TIMEOUT` error is emitted. |
+| `timeout` | `number` | `300_000` | Worker **inactivity** timeout (ms) for `loadModel()`/`process()`. Every worker message (progress, fallback, internal heartbeat) resets it; a silent worker is killed with a non-recoverable `TIMEOUT` error, a progressing worker is never killed by it. **v0.3.0 semantic change:** was an absolute wall-clock cap that could kill a slow-but-progressing job. |
+| `hardTimeoutMs` | `number` | disabled | Optional **absolute** cap (ms) that overrides the idle logic — the operation is killed when total elapsed time exceeds it even if progress continues. For consumers who need a guaranteed upper bound. |
 | `maxDimension` | `number` | `16384` | Maximum allowed input width/height in px. Exceeding it emits a non-recoverable `DIMENSION_LIMIT` error. Neural inference additionally refuses inputs whose 4× intermediate would exceed this limit. |
 | `ortWasmPaths` | `string` | jsDelivr CDN for the pinned ORT version | Directory for **ONNX Runtime's own** `.wasm`/`.mjs` artifacts (including the JSEP binary). Self-host by copying ORT's `dist/` files. This is unrelated to the Rust scaler binary shipped in `dist/wasm/`. |
 | `quantization` | `'fp32' \| 'fp16' \| 'int8'` | `'fp16'` | Which model variant to request when `modelUrl` is a base directory. fp32 ≈ 64 MB, fp16 ≈ 32 MB, int8 ≈ 16 MB. |
+| `gpuPreference` | `'high-performance' \| 'low-power' \| 'default'` | `'high-performance'` | Adapter preference for WebGPU probing. **v0.3.0 change from unspecified:** this is a compute workload, so the engine now explicitly asks for the high-performance adapter — browser defaults may pick an iGPU on dual-GPU machines (10–50× slower). |
 
 ### Methods
 
 | Method | Signature | Throws / emits |
 | --- | --- | --- |
-| `detectDevice` | `(): Promise<Capabilities>` | Memoized hardware probe → `{ webgpu, wasm, wasmThreads, lowVram }`. |
-| `loadModel` | `(): Promise<LoadModelResult>` | Cache-first model download + ORT session creation. Resolves `{ variant: 'webgpu' \| 'wasm'; url: string; cached: boolean }` — which file was actually selected and whether it came from cache. Throws `MODEL_URL_REQUIRED` if neither `modelUrl` nor `models` was configured, `MODEL_VARIANT_MISSING` if the catalog lacks the variant the probed device needs. Emits `model_download` while streaming (nothing on cache hits). Idempotent. |
+| `detectDevice` | `(): Promise<Capabilities>` | Hardware probe (memoized per `gpuPreference`; an explicit argument re-probes for that preference) → `{ webgpu, wasm, wasmThreads, lowVram }` plus v0.3.0 optional fields: `adapterInfo` (raw adapter identity), `dualGpu` (two power-preference probes returned different adapters — the only enumeration stable WebGPU offers), `secondaryAdapterInfo`, `softwareGpu` (SwiftShader/LAVAPIPE/llvmpipe detection), `gpuTier` (`'software' \| 'entry' \| 'mid' \| 'high'` — **a labeled heuristic**; the raw `adapterInfo` is always shown beside it, unknown ⇒ `'entry'`). |
+| `loadModel` | `(): Promise<LoadModelResult>` | Cache-first model download + single-EP ORT session creation. Resolves `{ variant, url, cached, reason? }` — which file was selected, whether it came from cache, and (additive, v0.3.0) WHY when the choice is non-obvious: a **software-GPU adapter routes to `models.wasm`** when present (the software WebGPU EP is a CPU rasterizer in disguise); otherwise `reason` notes dual-GPU selection. Throws `MODEL_URL_REQUIRED` if neither `modelUrl` nor `models` was configured, `MODEL_VARIANT_MISSING` if the catalog lacks the variant the probed device needs. Emits `model_download` while streaming (nothing on cache hits). An explicit preference argument re-probes and rebuilds the session (no hot adapter swap). Idempotent. |
 | `process` | `(buffer: ArrayBuffer, options: ProcessOptions): Promise<Blob>` | Resolves with the encoded Blob **and** emits `complete` with a blob URL (consumer revokes). Throws/see errors below. |
 | `on` | `<K>(type: K, handler): () => void` | Typed subscription; returns an unsubscribe function. |
 | `off` | `<K>(type: K, handler): void` | Removes a handler. |
 | `destroy` | `(): void` | Terminates the worker (freeing the ORT session and all WASM memory — they lived in the worker's heap), rejects in-flight operations with `DESTROYED`, clears listeners. The instance is unusable afterwards. |
+| `getDiagnostics` | `(): EngineDiagnostics` | **v0.3.0.** Synchronous truth snapshot: `{ capabilities, chosenVariant?, requestedEp?, actualEp?, adapterInfo?, gpuTier?, dualGpu?, lastTileDurationMs?, sessionActive }`. `actualEp` comes from which single-EP session creation SUCCEEDED — recorded fact, never guessed. Answers "which GPU actually ran it". |
 
 ### `process` options
 
@@ -121,7 +124,7 @@ All operational failures are emitted on the `error` event **and** rejected on th
 | `MODEL_DOWNLOAD_FAILED` | Fetch failed (network, non-2xx, CORS). | Yes — retry |
 | `INVALID_SCALE` / `INVALID_METHOD` / `INVALID_INPUT` | Usage errors (scale ∉ {2,4}, bad format/quality, empty/detached buffer). | Yes — fix input |
 | `DIMENSION_LIMIT` | Input exceeds `maxDimension` (default 16384×16384). | No (per spec) — use a smaller input |
-| `TIMEOUT` | Operation exceeded `timeout`; worker killed. | No |
+| `TIMEOUT` | No worker activity for `timeout` ms (inactivity), or `hardTimeoutMs` elapsed; worker killed. | No |
 | `WASM_SCALER_FAILED` | Rust scaler threw (e.g. OOM on a huge image). | No |
 | `INFERENCE_FAILED` | Neural inference failed and was not recoverable via fallback. | No |
 | `DECODE_FAILED` / `ENCODE_FAILED` | Input undecodable / result unencodable in the worker. | Yes — fix input |
@@ -142,7 +145,7 @@ engine.on(type, handler) // returns unsubscribe
 | Event | Payload | Notes |
 | --- | --- | --- |
 | `model_download` | `{ progress: number }` | 0..1, streamed during model fetch. **Never emitted on cache hits.** |
-| `tile_processing` | `{ tileIndex: number; totalTiles: number }` | Zero-based index of each tile as it *starts*. Classical methods are not tiled — exactly one event, `{ tileIndex: 0, totalTiles: 1 }`. |
+| `tile_processing` | `{ tileIndex: number; totalTiles: number; tileDurationMs?; etaMs? }` | Neural: fires as each tile **completes** with `tileDurationMs` (duration of that tile — the first includes model warmup, expected) and a running-average `etaMs`. Classical methods are not tiled — exactly one event on completion, `{ tileIndex: 0, totalTiles: 1, tileDurationMs }`. |
 | `fallback` | `{ from: 'webgpu'; to: 'wasm'; reason: string; swappedTo?: 'wasm-variant' \| 'same-file' }` | WebGPU failed at session creation **or** mid-inference (OOM, context/device loss): the session is disposed, recreated on WASM, and the same inference retried. With a `models` catalog this swaps to the `wasm` variant file (`swappedTo: 'wasm-variant'`, loaded through the same cache-first path); with a single `modelUrl` the same file is reloaded on the WASM EP (`swappedTo: 'same-file'`). Not an error. |
 | `complete` | `{ blobUrl: string }` | Object URL created by the engine for the result Blob. |
 | `error` | `{ message: string; recoverable: boolean }` | See the error table above. |
